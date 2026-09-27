@@ -1,0 +1,277 @@
+# 部署
+
+[English](deploying.md) · [中文](deploying.zh.md)
+
+兩條支持的路徑，按工作量排：
+
+1. **Docker 自托管**——拉取预构建的 GHCR 镜像（或从 `docker/Dockerfile` 自己构建）；单机 VPS 自带 Postgres+pgvector。
+2. **作為庫嵌入**——从 crates.io 把 `core + llm + store` 嵌进你自己的服務，不要 HTTP 層。
+
+## 兩種方式都需要的前置
+
+- Postgres 16+，裝了 `pgvector` extension（≥ 0.7）。
+- 一個 OpenRouter 賬號（`OPENROUTER_API_KEY`）。
+- 一個 Voyage AI 賬號（`VOYAGE_API_KEY`）——除非 `[tasks.embedding]` 把 read 和 write 都路由离开 Voyage，否则必需（见 [model-config.zh.md](model-config.zh.md)）；默认配置（没有 `[tasks.embedding]` 块）仍然需要它。
+- 要麼 Supabase 項目（默認 JWT auth 用），要麼你自己的 JWT 簽發者（實現 `AuthValidator`）。
+
+## 子命令
+
+二進制文件有四種模式（按 `argv[1]` 分派）：
+
+| 子命令 | 用途 |
+|---|---|
+| `serve`（默認） | 在 `BIND_ADDR` 上跑 HTTP 服務器 |
+| `migrate` | 應用待處理的 sqlx migrations 然後退出 |
+| `seed-personas [dir]` | 读 `[dir]` 里每个 `*.toml` 文件（默认 `/etc/eros-engine/personas`——Docker 镜像里烧的示例），upsert 为人格基因 |
+| `print-openapi` | 把 OpenAPI 规范打到 stdout 后退出（不连 DB、不读 env；CI 漂移检查用） |
+
+`seed-personas` 是冪等的——再跑會 update 原有行（按 `name` 匹配），保持 UUID 跟 `persona_instances` 裡的 FK 引用穩定。
+
+## 路径 1：Docker 自托管
+
+每个 `v*` tag 都会往 GitHub Container Registry 发布 `eros-engine-server` 的多架构镜像（`linux/amd64` + `linux/arm64`；想自己构建的话 `docker/Dockerfile` 就是同一份产物）：
+
+```bash
+docker pull ghcr.io/etherfunlab/eros-engine:latest   # 或钉一个版本 tag
+```
+
+单机 VPS 部署，把 Postgres+pgvector 跟引擎放进同一个 compose stack，大致长这样（仓库不带 compose 文件——自己写一份；按需要调端口、卷、env）：
+
+```yaml
+# compose.yml（草图）
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: eros_engine
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+    volumes:
+      - eros_pg:/var/lib/postgresql/data
+
+  engine:
+    image: ghcr.io/etherfunlab/eros-engine:latest  # 生产环境钉一个版本 tag
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/eros_engine
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY}
+      SUPABASE_URL: ${SUPABASE_URL}   # JWKS 校验——2025 之后 Supabase 的默认方式
+      # SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET}   # 旧版 HS256 备选
+    ports: ["8080:8080"]
+
+volumes:
+  eros_pg:
+```
+
+没有任何东西会自动迁移——第一次 `serve` 之前、以及每次升级镜像之后，都要手动跑一次 `migrate` 子命令：
+
+```bash
+docker compose up -d postgres
+docker compose run --rm engine migrate
+docker compose run --rm engine seed-personas /etc/eros-engine/personas  # 可选：示例人格（手动步骤——按 name upsert）
+docker compose up -d engine
+```
+
+**已有部署要跨 v1.6.x–v1.7.2 升级？** 这段是一条四个版本的链，每个迁移只对前一跳的代码安全——跳过任何一跳，rollout 期间线上流量就会出问题——有的路径丢写入，有的路径读全挂。跨版本前先读 [migrating/v1-7-2-llm-generations.md](migrating/v1-7-2-llm-generations.md)（英文；全新安装不受影响）。
+
+至少要接一个 auth 来源——非对称 JWKS 校验用 `SUPABASE_URL`（或 `SUPABASE_JWKS_URL`），或者一个非空的旧版 `SUPABASE_JWT_SECRET`。两者都没有时引擎会拒绝启动——这是刻意设计，让配错的部署直接报错，而不是默默拒掉每一个请求。
+
+**模型配置：**镜像把脱敏过的 `examples/model_config.toml` 烧在 `/etc/eros-engine/model_config.toml`，并预设了 `MODEL_CONFIG_PATH` 指向它，所以容器开箱即可启动。注意烧进去的示例带有生效的 `[tasks.world_*]` section——零注册时无害（不会有 LLM 调用），但世界 sweeper 会跑起来；想让[世界系统](world-system.zh.md)完全不动就设 `WORLD_DISABLED=true`。
+
+反过来，烧进去的示例里 `[tasks.chat_image_prompt_compose]` 是注释掉的——而出图 prompt 合成器是图片能力的必需项，所以开箱状态下图片轮次不可用，图片动作会静默降级为纯文本，直到你配置好这个块。见[模型配置 → 出图 prompt 合成器](model-config.zh.md#taskschat_image_prompt_compose--出图-prompt-合成器图片轮次必需)。
+
+真实部署时挂载你自己的配置并把 `MODEL_CONFIG_PATH` 指过去——或者设 `MODEL_CONFIG_DIR` 指向一个挂载目录，里面的 `.toml` 片段会在启动时合并。两者互斥，而镜像预设了 `MODEL_CONFIG_PATH`，所以走目录路线要显式清掉它（`MODEL_CONFIG_PATH=`——空值等同未设置）。见[模型配置](model-config.zh.md)。
+
+前面放個真正的 Caddy / Traefik / Cloudflare 做 HTTPS 終止。
+
+## 路徑 2：作為庫嵌入
+
+如果你不需要 HTTP 層——比如你在這個基礎上搞另一個產品——直接跳過 `eros-engine-server`。三个库 crate 都发布在 crates.io 上：
+
+```toml
+[dependencies]
+eros-engine-core  = "1.0"
+eros-engine-llm   = "1.0"
+eros-engine-store = "1.0"
+```
+
+（要跟未发布的开发进度，改用 `{ git = "https://github.com/etherfunlab/eros-engine", branch = "main" }`。）
+
+然後構造 pool、倉儲、LLM 客戶端，寫你自己的分派層：
+
+```rust
+let pool = eros_engine_store::pool::build(&database_url).await?;
+let openrouter = eros_engine_llm::openrouter::OpenRouterClient::new(or_key);
+let voyage = eros_engine_llm::voyage::VoyageClient::new(voyage_key);
+
+let affinity_repo = eros_engine_store::affinity::AffinityRepo { pool: &pool };
+let mut affinity = affinity_repo
+    .load_or_create(session_id, user_id, instance_id)
+    .await?;
+
+let signals = eros_engine_core::ghost::GhostSignals { … };
+match eros_engine_core::ghost::decide(&affinity, signals) {
+    GhostDecision::Reply  => { /* 跑 chat */ }
+    GhostDecision::Ghost => { /* 保持沉默 */ }
+}
+```
+
+迁移文件随 `eros-engine-store` crate 发布（`migrations/` 目录）；把 `sqlx::migrate!("<path>")` 指向该目录、对你的 pool 跑。这个宏要编译期路径，所以要么 vendor 这个目录、要么用 path 依赖——server 自己用的是 `sqlx::migrate!("../eros-engine-store/migrations")`。
+
+## 自帶 Auth
+
+默认 JWT 验证器是 Supabase——通过 `SUPABASE_URL` / `SUPABASE_JWKS_URL` 走 JWKS 非对称校验（ES256/RS256/EdDSA），另有旧版 HS256 共享密钥回退（`SUPABASE_JWT_SECRET`）。換別的 IdP 就實現這個 trait：
+
+```rust
+use async_trait::async_trait;
+use eros_engine_server::auth::{AuthError, AuthValidator};
+use uuid::Uuid;
+
+pub struct MyValidator { /* … */ }
+
+#[async_trait]
+impl AuthValidator for MyValidator {
+    async fn validate(&self, bearer: &str) -> Result<Uuid, AuthError> {
+        // 在這裡驗你的 token，返回 user_id
+    }
+}
+```
+
+然後把你的實例注入 `AppState.auth: Arc<dyn AuthValidator>`。中間件（`auth::middleware::require_auth`）對你提供的任何驗證器都通用。
+
+（`eros-engine-server` 有意不作为库发布，所以这一节是给 fork server 跑的人看的。路径 2 的嵌入方完全跳过 HTTP auth 层，自己做鉴权。）
+
+## 自帶 Postgres
+
+任何 sqlx Postgres 驅動兼容的都能用——Supabase、Neon、RDS、Crunchy Bridge、純自托管都行。硬要求：裝了 pgvector extension（`CREATE EXTENSION vector;`）。引擎自己建 schema（遷移 `0000_schema.sql` 裡的 `CREATE SCHEMA IF NOT EXISTS engine;`），跟數據庫裡其他東西可以乾淨共存。
+
+如果跟另一個服務共用一個數據庫，引擎的表都在 `engine.*` 下、永不寫 `public.*`——零衝突。
+
+### Supabase 部署——schema 暴露地雷
+
+如果你的 Postgres 是 Supabase，**而且**把 `engine` 加進了項目的 Exposed Schemas 列表（Studio → Settings → API → Exposed schemas）——通常是為了讓同部署的 web 端能用 `@supabase/supabase-js` 讀 `engine.*`——那你可能同時把每張 `engine.*` 表都暴露給了可公開的 `anon` key，取決於 Studio Permissions 面板給了哪些角色什麼授權。
+
+風險：拿到 publishable anon key 的人（這個 key 按設計就會出現在每個瀏覽器 bundle 裡）只要：
+
+```bash
+curl "https://<project>.supabase.co/rest/v1/chat_messages?select=*&limit=5" \
+  -H "apikey: <publishable-anon-key>"
+```
+
+就能讀所有用戶的聊天記錄——如果 `anon` 曾經被授權對 `engine.chat_messages` 的 SELECT 的話。
+
+遷移 `0013_supabase_lockdown.sql`（eros-engine 0.2+ 起內建）通過三步堵這個洞：
+
+1. 對每張 `engine.*` 表執行 `REVOKE ALL FROM anon, authenticated`
+2. 對 schema 本身執行 `REVOKE USAGE ON SCHEMA engine FROM anon, authenticated`
+3. 對每張 `engine.*` 表執行 `ENABLE ROW LEVEL SECURITY`（無策略——縱深防禦；`postgres` 用戶和 `service_role` 都繞過 RLS，所以引擎本體和任何服務端的 Supabase client 都不受影響）
+
+遷移外面包了 `IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon')`，所以非 Supabase 的 Postgres 部署（Neon、RDS、自托管）會靜默跳過 REVOKE，只繼承無害的 RLS enable。
+
+**如果你是從 0.2 之前的版本升上來、又跑在 Supabase 上，跑一次 `eros-engine migrate` 應用它就行——這個遷移是冪等的。**
+
+要獨立審計你的項目（與本遷移無關），以 `postgres` 角色執行：
+
+```sql
+-- engine.* 裡哪些表沒開 RLS？
+SELECT relname FROM pg_class
+ WHERE relnamespace = 'engine'::regnamespace
+   AND relkind = 'r' AND NOT relrowsecurity;
+
+-- engine.* 裡哪些表給 anon / authenticated 開了權限？
+SELECT grantee, table_name, privilege_type
+  FROM information_schema.role_table_grants
+ WHERE table_schema = 'engine'
+   AND grantee IN ('anon', 'authenticated');
+```
+
+應用遷移後，兩個查詢都應返回零行。
+
+## 運維注意事項
+
+### Prompt 日志（调试用，可选）
+
+设置 `PROMPT_LOG_DIR` 后，引擎会把每一轮**主回复**组装好的完整 prompt 写成一个
+可读文件（头部元数据 + 按 role 分块）。默认**关闭**，**仅供运营调试**（文件含原始
+聊天内容），写入为后台 fire-and-forget，绝不阻塞或拖垮回复。把它指向你自己挂载的卷：
+
+```yaml
+# docker-compose: 挂载卷并设置 env
+services:
+  engine:
+    environment:
+      PROMPT_LOG_DIR: /data/prompt-logs
+    volumes:
+      - ./prompt-logs:/data/prompt-logs
+```
+
+```toml
+# fly.io: 声明卷和 env（示例）
+[mounts]
+source = "prompt_logs"
+destination = "/data/prompt-logs"
+
+[env]
+PROMPT_LOG_DIR = "/data/prompt-logs"
+```
+
+引擎不内置轮转或保留策略——卷由你自行管理。
+
+### 世界系统（实验特性，可选）
+
+[世界系统](world-system.zh.md)（World Memories 模拟 + World Town 动态 +
+World Stories 按实例生活模拟）默认完全关闭：模型配置里没有
+`[tasks.world_director]` section 时，不会起任何 sweeper，每回合零查询。开启
+它是配置 + 数据层面的决定，不需要改部署：
+
+1. 在模型配置中加入 `[tasks.world_*]` section（见
+   [`examples/model_config.toml`](../examples/model_config.toml)）。
+2. 通过 `service_role` / owner 连接往 `engine.world_enrollments` 插行来注册
+   owner（引擎只读这张表）；对需要动态流的 owner 把 `town_enabled` 设为
+   `true`，要 World Stories 的再把 `stories_enabled` 设为 `true`。
+
+- `engine.world_worldviews`——每 owner 的世界观文本（1..=10000 字符）。
+  下游写、引擎读。引擎不带默认值：已注册但没有这行（或内容为空）的 owner
+  **不会**有任何世界系统 LLM 活动，直到提供为止。更新内容会在下一个 tick
+  重置该 owner 的世界（已发布的小镇贴文保留为历史）。
+
+运维开关，均可选：
+
+| 变量 | 作用 |
+|------|------|
+| `WORLD_DISABLED=true` | 总关：不起 sweeper、不注入 prompt、零成本 |
+| `WORLD_PROMPT_DISABLED=true` | 照常模拟积累，但不动聊天 prompt（灰度阀门） |
+| `WORLD_TICK_SECS` | 导演 sweeper tick（默认 300；`0` 关停） |
+| `WORLD_TOWN_DISABLED=true` | 仅小镇：不生成贴文、不起小镇 sweeper；记忆照常运行 |
+| `WORLD_STORIES_DISABLED=true` | 仅故事：不跑生活轮、不注入 `[world_stories]`；记忆照常运行 |
+| `WORLD_STORIES_PROMPT_DISABLED=true` | 生活照常模拟，但不动聊天 prompt（灰度阀门） |
+
+成本形状：每个**有可用世界观**的注册 owner 每 `interval_hours` 一次导演调
+用，外加（仅小镇）按活动触发的每小时评论轮和按 owner 限额的回复，外加（仅
+故事）按各自节奏跑的按实例生活轮。没有世界观的 owner（见上）整个跳过、零成
+本。没人互动的世界恰好只花导演那一次调用。细节、数据模型与启动校验规则见
+[世界系统](world-system.zh.md)。
+
+- **环境变量：**完整的变量清单在 [`.env.example`](../.env.example)；该文件刻意精简——细节以本指南和 [model-config.zh.md](model-config.zh.md) 为准。
+- **好感度调参：**写入管线的旋钮——`AFFINITY_GRADE_UNIT_BOND`、`AFFINITY_GRADE_UNIT_CHEM`、`AFFINITY_NEG_FACTOR`、`AFFINITY_TIER_DECAY`、`AFFINITY_CROSS_PENALTY_RATIO`、`AFFINITY_CROSS_PENALTY_START`、`AFFINITY_DELTA_THRESHOLD`、`AFFINITY_DEMO_BOOST`，以及端点派生三件套 `AFFINITY_FLOOR_RATIO` / `AFFINITY_TIME_DECAY_RATE` / `AFFINITY_TIME_DECAY_FLOOR`——全部可选，回退到 4.0 默认值。见[好感度模型 → 写入管线](affinity-model.zh.md#写入管线affinity-40)。
+- **回声消除：** 每个 text 轮会注入该 session 最近消息的一个窗口（窗口大小见下面的**噪声消除**），而模型会复读 —— 线上七个模型实测 0.57%–15.38% 的 assistant 轮命中，没有一个是零。留在窗口里的重复会推高下一份拷贝的概率，那份拷贝又被存下来、又被注入。因此在单轮注入的消息里，任何出现超过一次的非空字符串，其所有出现都不注入，唯一例外是当前轮自己的用户消息，它永远保留。被丢掉的位置不回补。比较是逐字节的，且不区分角色。`CHAT_ECHO_CANCELLATION_DISABLED=1` 可以关掉；voice 路径有自己的窗口，不受影响。有丢弃的轮次会打一行 `INFO`，只含计数，不含消息内容。设计文档：[回声消除](superpowers/specs/2026-08-19-chat-echo-cancellation-design.md)。
+- **噪声消除：** 一个 text 轮仍然取该 session 最近 20 条消息，但只注入其中一部分（至少 3 条，通常不超过 17 条，上限只取决于取到的行数，见下），并且会把每条注入的 assistant 行的首句剥掉 —— 首句承载的是模型模仿自己的那部分语气（`唔` / `啊` / `嗯啊`），几乎不承载信息。同时剥掉这些行里的括号动作块（`（凑近）`这类舞台指示）并折叠剩下的空白 —— 动作块会自我传染：模型在自己近几条回复里看到什么，接下来就会写更多，光靠指令压不住历史示范出来的东西，所以让历史不再展示它们；自发出现的那部分由 `[output]` 行的标注禁令兜住。落库的 `content` 保留原文，剥的只是注入的副本。剥完为空的 assistant 行整行丢弃，不会以空内容送出（部分供应商会拒绝）；user 行不剥。注入几条取决于这段关系的 `character_insights` 行填得有多满：十个字段里非空达到 7 个，稳态下只注入 3 条 —— 当前轮永远保留，再加上上一轮的问答（上一条用户消息 + 它的助手回复）—— 每少一个字段多注入 2 条，行缺失或全空时多注入 14 条（稳态下共 17 条）。保护的是上一轮问答本身，不是固定两条，但设了下限：两条相邻的 user 行（用户连发两句、一轮被鬼、或某条 assistant 行被剥空后在上游被丢弃）不会顶掉角色真正的上一句回复 —— 下限兜住 2 条。如果那一轮助手侧留了不止一条（比如文字回复之外又插了一条图片行），保护范围会跟着扩大——总数因此可能超过 17，上限只取决于剥完之后还剩多少行。`CHAT_NOISE_CANCELLATION_DISABLED=1` 完整恢复改动前的形状：固定 20 条窗口，assistant 行整条注入，且 prompt 里不再注入 `[character_state]` 块（见[接口参考](api-reference.zh.md#get-v2compinstanceinstance_idinsightcharacter)）。剥空过行或收窄过窗口的轮次会打一行 `INFO`，只含计数，不含消息内容。设计文档：[噪声消除](superpowers/specs/2026-09-02-echo-cancellation-plus-design.md)。
+- **后台 sweeper：**`serve` 还会跑 dreaming-lite（会话结束记忆分类器）和 insight 快照两个 sweeper。都可选：`DREAMING_DISABLED=1` / `SNAPSHOT_DISABLED=1` 关掉，不影响聊天路径。dreaming 每 `DREAMING_TICK_SECS`（默认 300）秒醒一次，分类空闲至少 `DREAMING_IDLE_SECS`（默认 1800）秒的会话；分类认领超过 `DREAMING_CLAIM_STALE_SECS`（默认 600）秒视为 worker 崩溃、可被重新认领。`DREAMING_VOICE_DISABLED=1` 会把清扫器收回到只扫文字 session（默认结束的语音通话也会被蒸馏成记忆——见 [memory-layers.zh.md](memory-layers.zh.md#语音轮次)）。快照 sweeper 按 6 段 cron `SNAPSHOT_CRON`（默认 `0 0 23 * * *`）在 `SNAPSHOT_TZ`（默认 `Asia/Singapore`）时区运行；cron 解析失败则 sweeper 不启动（聊天路径不受影响），时区解析失败回退默认值。
+- **异步对话队列（可选）：**`POST /v2/comp/session/{session_id}/message/async`（见 [API 参考](api-reference.zh.md#post-v2compsessionsession_idmessageasync)）把一轮对话交给后台 worker 处理，而不是流式返回——回复落在 `engine.chat_messages`，从历史接口或 Supabase Realtime 读取。这是第五个启动期 sweeper；`CHAT_QUEUE_DISABLED=1` 只停 worker（跟其他 sweeper 一致）——入队照样成功，只是会一直 `pending` 到重新开启。（worker 关闭时 stream 轮次仍由请求自己驱动，但回收器也停了：崩溃遗留的 `claimed` 行不会被回收，会一直挡住该会话的异步轮次，直到重新开启。）worker 每 `CHAT_QUEUE_TICK_SECS`（默认 5）秒醒一次，外加每次入队的即时唤醒；同时最多跑 `CHAT_QUEUE_CONCURRENCY`（默认 4）轮；认领超过 `CHAT_QUEUE_GEN_TIMEOUT_SECS` + `CHAT_QUEUE_CLAIM_STALE_SECS`（默认 300 + 300）秒视为 worker 崩溃、可被重新认领——stale 窗口是生成截止线**之后**的宽限，还在跑的轮次不会被中途回收；一轮总共最多跑 `CHAT_QUEUE_MAX_ATTEMPTS`（默认 3）次，用完标记为 `failed`；单次生成上限 `CHAT_QUEUE_GEN_TIMEOUT_SECS`（默认 300）秒；`CHAT_QUEUE_PENDING_CAP`（默认 20）是单会话入队深度上限，超过返回 `429 rate_limited`。这些参数填零或负值时回退默认值——只有 `CHAT_QUEUE_CONCURRENCY=0` 有含义：worker 不认领任何轮次（只做回收），等于第二个开关。队列顺序是严格的单会话 LIFO——会话里最新的消息最先处理，不会被丢弃或合并。stream 轮次以 born-claimed 行的形式共用这张表（单次尝试，由请求自己的 drive task 结算）；只有进程半途死亡、行被回收后，worker 才会接手。设计文档：[async chat endpoint spec](superpowers/specs/2026-08-20-async-chat-endpoint-design.md)。
+- **OpenRouter 归因（可选）：**在模型配置的 `[providers.openrouter]` 下声明一个 `headers` 表——`HTTP-Referer` / `X-OpenRouter-Title` / `X-OpenRouter-Categories`——给每个出站 OpenRouter 调用加归因头，让部署出现在 OpenRouter 的应用面板上；不写这个条目（或不写它的 `headers` key）就保持匿名。见 [model-config.zh.md → 通过 `[providers].openrouter` 覆盖内置端点](model-config.zh.md#通过-providersopenrouter-覆盖内置端点)。旧的 `OPENROUTER_APP_REFERER` / `OPENROUTER_APP_TITLE` / `OPENROUTER_APP_CATEGORIES` 环境变量已软废弃：仍然设置也只会被静默忽略，不是启动报错；`OPENROUTER_BASE_URL` 则彻底移除——改用 `[providers].openrouter.chat` / `.embeddings` 覆盖端点 URL。
+- **健康探針：** `GET /healthz` 返 200，響應 `{ status: "ok", service, version, timestamp }`。把這個接到平台的健康檢查上。
+- **OpenAPI / Scalar：** `GET /docs` 提供實時的 Scalar 參考。原始 OpenAPI JSON 不走 HTTP——用 `print-openapi` 子命令导出。
+- **给前端的好感度：** `GET /bff/v1/comp/affinity/{session_id}` 返回读时刷新过的绝对向量，`.../event` 返回逐轮 delta 加该轮结束时的状态；`GET /bff/v1/comp/affinities/{user_id}` 是第一条的列表形态 —— 一次分页往返拿到该用户所有伴侣刷新后的值，给渲染会话列表的客户端用。三条都做 JWT + ownership 检查、都常驻——`v1.3.1` 起 `EXPOSE_AFFINITY_DEBUG` 开关和它挡着的 debug 路由都已删除。见 [migrating/v1-3-1-affinity-4-0.md](migrating/v1-3-1-affinity-4-0.md)。
+- **日誌：** `RUST_LOG=info` 是默認。`RUST_LOG=debug,sqlx=warn` 看到除 SQLx 查詢噪音以外的一切。
+- **成本：** OSS 部署默认 chat 使用一个快速廉价的模型、insight 抽取使用一个高质量抽取模型（当前默认值见 `examples/model_config.toml`）。一轮典型对话花费 ≪ $0.001 美元 token 成本，加上一个 Voyage embedding 调用（每个值得记住的事实约 $0.000003）。10000 轮对话花个位数美元。
+
+## 源碼
+
+- `docker/Dockerfile`——多阶段构建（Rust 1.88 构建器 → debian:bookworm-slim 运行时）；`ghcr.io/etherfunlab/eros-engine` 就是用它构建的同一份产物
+- `crates/eros-engine-server/src/main.rs`——子命令分派（上面那四种模式）
+- [`.env.example`](../.env.example)——运维环境变量清单（细节见本指南）

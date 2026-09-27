@@ -1,0 +1,109 @@
+# Prompt traits
+
+A per-request hook for injecting caller-controlled fragments into the
+persona system prompt.
+
+## Shape
+
+```jsonc
+{
+  "content": "...",
+  "client_msg_id": "01J3333333333333333333333A",
+  "prompt_traits": [
+    { "tag": "ascii_identifier", "text": "verbatim text to inject" }
+  ]
+}
+```
+
+Accepted on `POST /comp/chat/{session_id}/message/stream` and on
+`POST /v2/comp/session/{session_id}/message/async`, where the traits ride the
+queue and are re-validated in the worker.
+
+## What the engine does
+
+For each turn, the validated `text` of every trait is rendered as a
+bullet under a `[additional_guidance]` section inside the persona system
+prompt, positioned between `[topics]` and `[turn_style]`. Empty list →
+the section is omitted and the prompt is byte-for-byte identical to
+the legacy output.
+
+## What the engine does NOT do
+
+- **Not persona state.** Traits are never written to the persona/genome
+  tables and are never auto-replayed on a later turn — each request must
+  re-supply the traits it wants applied. The engine does write an audit
+  copy into ordinary chat history: the verbatim `{tag, text}` array lands
+  in the user row's `chat_messages.metadata.prompt_traits_raw`, and the
+  kept (post-tier-gated) tags land in the assistant row's
+  `metadata.prompt_traits`.
+- **No content interpretation.** The engine treats `text` as opaque.
+  Sanitisation and user-consent gating are the caller's responsibility.
+- **No semantic categories.** `tag` is a logging key — the engine does
+  not interpret `"nsfw_boost"` differently from `"politics_open"`.
+- **Engine-side allow-listing (defense-in-depth only).** The engine now
+  drops trait tags that are not in the resolved tier's `allow_traits` list —
+  those tags are silently excluded from injection and the reply is still
+  generated normally. Caller-side blocking is still recommended as the
+  primary guard; engine-side filtering is defense-in-depth.
+
+## Tier gating
+
+Tags outside the request tier's `allow_traits` are not injected into the
+system prompt. Specifically:
+
+- Dropped tags are logged (tag name only, never the `text` body).
+- The reply is generated normally even if all traits are dropped.
+- Configure allow-lists per tier in `model_config.toml`:
+  ```toml
+  [tasks.chat_companion.tiers.gold]
+  allow_traits = ["allow_nsfw", "allow_politics"]
+  ```
+  Tier blocks are only valid under `chat_companion` and `chat_output_filter`;
+  a tier block under any other task refuses to boot (see
+  [model-config.md](model-config.md#tier-blocks-are-limited-to-two-tasks)).
+- **Three-state semantics:**
+  - `allow_traits` absent — no gating; all traits are injected.
+  - `allow_traits = []` — drop all traits.
+  - `allow_traits = ["a", "b"]` — whitelist; only listed tags are injected.
+- The `tier` field on the request selects the tier block (see
+  [api-reference.md](api-reference.md#post-compchatsession_idmessagestream)).
+  Unknown or absent tier → task default block's `allow_traits`.
+
+## Limits
+
+| Field                 | Limit                              |
+|-----------------------|------------------------------------|
+| `prompt_traits` count | ≤ 8                                |
+| `tag`                 | regex `^[a-z0-9_]{1,32}$`          |
+| `text`                | 1 ≤ chars ≤ 2000 (after trim)      |
+| `text` content        | no control characters (incl. `\n`) |
+
+Violations return `400 BadRequest` and **no user message row is persisted**.
+
+## Observability
+
+The engine logs an `info`-level event **only when the tier's `allow_traits`
+actually drops something** — message `prompt_traits: dropped tags not allowed
+for tier`, fields `tier`, `kept` (how many survived), and `dropped_tags` (the
+tags that were removed). A turn where every supplied trait is kept logs
+nothing. The `text` body is never logged.
+
+API callers without server-log access can see the result on the SSE `final`
+frame's `prompt_injected` field — the tags actually injected this turn, after
+tier gating. See [api-reference.md](api-reference.md).
+
+## Threat model
+
+A compromised client can attempt prompt-injection through `text`. The
+engine now performs server-side tag filtering via `allow_traits` (see
+"Tier gating" above), but protecting persona internals is ultimately the
+caller's responsibility. Use deployer-side allow-listing of `tag`
+values as the primary guard; the engine-side filtering is defense-in-depth.
+
+## Why not persona state?
+
+By design, the engine's persona table is the long-lived contract. Traits
+are intentionally kept out of it so caller-side experimentation, A/B
+testing, and per-session policy don't pollute persona rows or require
+migrations. (The `chat_messages.metadata` audit copy is ordinary chat
+history, not persona state — see "What the engine does NOT do" above.)

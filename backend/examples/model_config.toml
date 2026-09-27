@@ -1,0 +1,1003 @@
+# `model` accepts three forms (task-level and per-tier):
+#   model = "id"                       # fixed
+#   model = ["id_a", "id_b"]           # round-robin (deterministic alternation)
+#   model = { "id_a" = 0.8, "id_b" = 0.2 }  # weighted random (normalized by sum)
+# Weighted-table keys must be quoted (model ids contain "/" and ".").
+# If the selected primary also appears in `fallback`, it is auto-skipped.
+
+# ── Global defaults (optional) ───────────────────────────────────────────────
+# OpenRouter routing prefs (formerly [defaults].ignore_providers /
+# [defaults].provider_sort here) are removed — they're now
+# [[providers.<name>.body]] rules. See the example under "Custom providers"
+# below.
+#
+# ── Custom providers (optional) ──────────────────────────────────────────────
+# Route model slugs to your own endpoints. Each entry is a table with up to
+# three keys — `chat` (an OpenAI-compatible chat-completions URL), `embeddings`
+# (an OpenRouter-compatible embeddings URL), and `headers` (sent verbatim on
+# every request to this entry's endpoints):
+#
+#   [providers.venice]
+#   chat    = "https://api.venice.ai/api/v1/chat/completions"
+#   headers = { "X-Team" = "companion" }
+#
+#   [providers.local]
+#   embeddings = "http://127.0.0.1:8080/v1/embeddings"
+#
+# Rules:
+# - Names match [a-z0-9_]+. "voyage" is reserved ($VOYAGE_API_KEY belongs to
+#   the built-in native Voyage embeddings client).
+# - "openrouter" is special: declaring it overrides the BUILT-IN endpoints
+#   per key (an absent key keeps the official URL), and its `headers` table
+#   is the one home for the attribution headers (HTTP-Referer,
+#   X-OpenRouter-Title, X-OpenRouter-Categories). The old OPENROUTER_APP_*
+#   env vars are ignored; OPENROUTER_BASE_URL is gone.
+#
+#   [providers.openrouter]
+#   headers = { "HTTP-Referer" = "https://eros.example", "X-OpenRouter-Title" = "Eros" }
+#
+# - URLs are COMPLETE and posted verbatim — no path joining.
+# - The API key comes from env: [providers].venice → $VENICE_API_KEY
+#   (one key per entry, shared by both endpoints). Required only when some
+#   slug actually references the entry. `openrouter` uses the existing
+#   $OPENROUTER_API_KEY.
+# - `headers` cannot declare Authorization or Content-Type (engine-owned).
+# - Suffix a model slug with "@<name>" to route it. "@openrouter" is always
+#   valid and means the built-in endpoint — on chat tasks it is equivalent
+#   to writing no suffix at all.
+# - Model ids before "@" are the PROVIDER'S OWN slugs, sent verbatim; a
+#   literal "@" inside a model id is escaped "\@" (in TOML: "weird\\@vendor/m").
+# - Model-keyed tables (`display`, `output_regex` models, `output_filter`
+#   trigger models) always use the BARE id, never "id@provider".
+# - Custom providers receive a strict OpenAI-compatible request: per-task
+#   `reasoning` is inert for them; they receive exactly the headers (and any
+#   [[providers.<name>.body]] rules, see below) you declare for that entry.
+# - Under MODEL_CONFIG_DIR, [providers] merges as ONE top-level key.
+#
+# Per-provider custom body parameters. `params` is merged into the request
+# body verbatim; `tasks` scopes the rule (omit = every task on this
+# provider). Later rules win; params win over engine fields.
+# model/messages/stream are engine-owned (boot refusal).
+#[[providers.venice.body]]
+#tasks  = ["chat_companion"]
+#params = { venice_parameters = { include_venice_system_prompt = false } }
+#
+# Covers chat_vision too, even though that stage builds its own body — the
+# lever for models that ignore `reasoning = { enabled = false }`, reason
+# anyway, and bill for it (`reasoning_effort` is a separate top-level field,
+# not part of the `reasoning` object). Only `embedding` is uncovered.
+#[[providers.openrouter.body]]
+#tasks  = ["chat_vision"]
+#params = { reasoning_effort = "none" }
+#
+# OpenRouter routing prefs (the former [defaults].ignore_providers /
+# provider_sort) are now body params on the reserved openrouter entry —
+# bare provider slugs, no @openrouter suffix:
+#[[providers.openrouter.body]]
+#params = { provider = { ignore = ["some-bad-provider"], sort = "latency" } }
+#
+# Local Ollama is used only by semantic_extraction. Its OpenAI-compatible
+# endpoint accepts `reasoning_effort = "none"`, which prevents reasoning-only
+# models from consuming the completion budget before emitting JSON content.
+[providers.ollama]
+chat = "http://127.0.0.1:11434/v1/chat/completions"
+
+[[providers.ollama.body]]
+tasks = ["semantic_extraction"]
+params = { reasoning_effort = "none" }
+
+# Production custom-provider skeletons.  Replace the endpoint URLs and model
+# ids with the values supplied by the operator; the provider names deliberately
+# map to DEEPSEEK_API_KEY and DOUBAO_API_KEY respectively.
+[providers.deepseek]
+chat = "https://api.deepseek.com/chat/completions"
+
+[providers.doubao]
+chat = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+
+# Local BGE adapter (tools/local_embedding_server.py).  The Rust engine keeps
+# using its normal OpenAI-compatible HTTP embedding client.
+[providers.local]
+embeddings = "http://127.0.0.1:8091/v1/embeddings"
+
+# One-off repair of rows already persisted with byte-BPE garble (run manually,
+# NOT a migration — the engine refuses to own downstream prod data). Repairs the
+# two unambiguous whitespace glyphs only (Ġ→space, Ċ→newline), idempotent,
+# touches only rows that still contain a glyph:
+#   supabase db query --linked "UPDATE engine.chat_messages
+#     SET content = replace(replace(content,'Ġ',' '),'Ċ',E'\n')
+#     WHERE content ~ '[ĠĊ]';"
+#   supabase db query --linked "UPDATE engine.chat_messages
+#     SET pre_filter_content = replace(replace(pre_filter_content,'Ġ',' '),'Ċ',E'\n')
+#     WHERE pre_filter_content ~ '[ĠĊ]';"
+
+[tasks.chat_companion]
+# Example chat primary. deepseek-v4-flash is a cheap, fast, permissive
+# default — swap in whatever suits your product. The first fallback (Cydonia)
+# is roleplay-tuned so a primary outage doesn't make the companion prudish;
+# glm-4.7-flash is a fast, reliable last resort.
+# `fallback` accepts either a single string (legacy) or an array of model
+# ids in preference order. The chain is tried sequentially; first success
+# wins. An explicit empty value (`""` or `[]`) opts out of the defaults
+# block's fallback for this task.
+# Recommendation: keep `fallback` to at most 2 entries. The chain is truncated
+# to `retry_depth` entries before the streaming chat burst — default 2 on this
+# task (primary + 2 fallbacks = 3 attempts), settable here or per tier;
+# anything past the truncation point is never tried. The single-purpose tasks
+# below (output/input filter, vision, PDE, product QA, image compose) default
+# to retry_depth = 1 instead.
+model = "deepseek-v4-pro@deepseek"
+fallback = []
+temperature = 0.8
+# Sampling knobs. Every task except `embedding` may set these; extraction /
+# vision / affinity want determinism and deliberately leave them unset. They
+# ship as the OSS default on the chat task only; a deployment opts out by
+# removing them. top_p trims the long tail; the two penalties are the
+# repetition levers. repetition_penalty is available here too — it is a
+# standard OpenAI-format field every chat/completions endpoint accepts — and is
+# deliberately left unset in this example because it distorts CJK at the useful
+# range. Ranges are enforced at boot: top_p (0.0, 1.0], the two penalties
+# [-2.0, 2.0], repetition_penalty (0.0, 2.0] with 1.0 the no-op identity.
+top_p = 0.9
+frequency_penalty = 0.4
+presence_penalty = 0.2
+max_tokens = 4096
+# Companion replies only render `content`; the reasoning channel is ignored,
+# so disable it to save latency/cost. Same shape as OpenRouter's `reasoning`
+# object — set `{ exclude = true }` instead if you want it generated but hidden.
+# Inherited by every tier below.
+reasoning = { enabled = false }
+# Controls the `model` value sent to clients in chat `meta` frames. Affects ONLY
+# the client display — never the OpenRouter call or the persisted row. Omit this
+# line and the field defaults to `false` (the model name is NOT sent). Four forms:
+#   model_name_display_override = false               # omit model from meta
+#   model_name_display_override = true                # send the real model id (this line)
+#   model_name_display_override = "Aria"              # always show "Aria"
+#   model_name_display_override = ["Aria", "Nova"]    # random per bubble
+#   model_name_display_override = { "deepseek/deepseek-v4-flash" = "Aria", default = "Companion" }
+# Map keys must be quoted (ids contain "/" and "."); the bareword `default` key
+# is the fallback when the real id isn't listed (no default ⇒ omit). Task-level;
+# every tier inherits it.
+model_name_display_override = true
+# Optional prompt-trait allow-list (three-state). Commented out here means no
+# gating. See docs/prompt-traits.md.
+#allow_traits = ["nsfw_boost","politics_open"]
+
+# Per-tier overrides are OPTIONAL and downstream-defined: `tier` is whatever
+# your product sends per request. The OSS template enables none — with no tier
+# (or an unknown one) the task default block above is used. Uncomment and adapt
+# these as a starting point, or define your own. A tier may override
+# model / fallback / allow_traits; `model` here also accepts the array
+# (round-robin) and table (weighted) forms shown at the top of this file.
+#
+# Tier blocks are read by THIS task and [tasks.chat_output_filter] only. Every
+# other task resolves without a tier, so a [tasks.<other>.tiers.*] block could
+# never be selected — the server refuses to boot on one instead of ignoring it.
+#[tasks.chat_companion.tiers.free]
+#model        = "z-ai/glm-4.5-air"
+#fallback     = ["thedrummer/cydonia-24b-v4.1","z-ai/glm-4.7-flash"]
+#allow_traits = ["politics_open"]
+
+#[tasks.chat_companion.tiers.plus]
+#model        = "x-ai/grok-4.20"
+#fallback     = ["thedrummer/cydonia-24b-v4.1", "x-ai/grok-4.3"]
+#allow_traits = ["nsfw_boost", "politics_open"]
+
+# (belongs to the [tasks.chat_companion] table above)
+# Deterministic per-model regex strips for the assistant reply. Task-level only
+# (no per-tier override). Each rule deletes (or replaces) matches in replies
+# produced by any model in `models`. Applied BEFORE the client sees the reply,
+# before any LLM output_filter, and before memory/insight/affinity extract — so
+# the matched text reaches neither the client nor the stored history/memory. The
+# raw reply is kept on the row's pre_filter_content (filter_model = "<regex>").
+# Uses the Rust `regex` crate: NO lookaround/backreferences — anchor with $, ^,
+# \s*, char classes. An invalid pattern fails server boot.
+# output_regex = [
+#   # Strip L3.3-Euryale's self-narrated photo line on reply_text_image turns.
+#   { models = ["sao10k/l3.3-euryale-70b"],
+#     pattern = '\s*\[你的照片[：:][^\]]*\]\s*$' },
+#   # { models = ["x/y"], pattern = '...', replacement = "…" },  # replacement default "" = delete
+# ]
+
+# ── Optional output filter (OFF by default) ──────────────────────────────
+# Rewrites the chat reply through a second LLM before the client sees it.
+# Enable per-tier (or globally) with `output_filter` on [tasks.chat_companion]:
+#   [tasks.chat_companion]
+#   output_filter = true                 # global default (default: false)
+#   [tasks.chat_companion.tiers.gold]
+#   output_filter = true                 # per-tier; overrides the global default
+#
+# The filter only runs if BOTH output_filter is true AND this table exists with
+# a non-blank filter_prompt; otherwise it is inert. Only the FILTERED text is
+# shown/stored; extract (memory/insight/affinity) reads the original by default.
+#
+# ── Recommended models for chat_output_filter ────────────────────────────
+# Primary: openai/gpt-5.4-nano — fast, stable filtered output.
+#
+# DO NOT use openai/gpt-4.1-nano as the filter model — it empirically returns
+# "对不起，无法满足你的要求"-style refusals with HTTP 200, which the engine
+# cannot distinguish from a successful filtered rewrite, so the fail-open path
+# never triggers and the user sees the refusal text.
+#
+# Recommended fallback: google/gemini-3.1-flash — high success rate; when it
+# does fail it surfaces a proper error response (non-200), letting the engine's
+# fail-open path kick in and emit the original reply.
+#
+# Cost-saving fallback: zhipuai/zlm-4.7-flash — cheaper, similar fail-mode
+# profile to gemini-3.1-flash.
+#
+# DO NOT use anthropic/claude-haiku-4.5 for the filter — its input tolerance
+# for NSFW (great for extraction) does NOT extend to output; the safety
+# alignment on the output side is strict enough that the filter LLM often
+# refuses to produce rewritten text at all.
+#[tasks.chat_output_filter]
+#model        = "openai/gpt-5.4-nano"
+#fallback     = ["google/gemini-3.1-flash", "zhipuai/zlm-4.7-flash"]
+#retry_depth  = 1     # fallbacks to try on filter failure; default 1 (primary + first fallback)
+#temperature  = 0.3
+#max_tokens   = 400
+#filter_prompt = """
+#Rewrite the assistant reply below per <your policy>. Output only the rewrite.
+#"""
+# trigger: AND of the predicates you specify; omit all ⇒ filter every turn.
+# `traits` matches the tags ACTUALLY injected (after tier allow_traits gating),
+# i.e. the same set reported in the final frame's prompt_injected.
+#trigger      = { random = 0.3, models = ["x/y"], traits = { any = ["nsfw_boost"], when = "present" } }
+#timing       = "after_extract"   # or "before_extract"
+#[tasks.chat_output_filter.tiers.gold]
+# per-tier may override model/fallback/retry_depth/filter_prompt/trigger/timing
+# (NOT temperature/max_tokens/top_p/frequency_penalty/presence_penalty/
+#  repetition_penalty — those are task-level only, like every other task)
+#filter_prompt = "..."
+
+# ── Optional user-input rewrite filter (OFF by default) ──────────────────────
+# Rewrites a MEANINGLESS user turn (e.g. "1111", "？？？", key-mashing) into one
+# natural, context-appropriate user message before it reaches chat_companion, so
+# the companion answers a real message instead of parroting history. Meaningful
+# turns — including short ones like "嗯"/"好啊"/"在吗" and genuine short
+# questions — are left untouched.
+#
+# Enable with a single global switch on [tasks.chat_companion]. It accepts a
+# bool OR a probability:
+#   [tasks.chat_companion]
+#   input_filter = false   # off (default)
+#   input_filter = true    # run on every user turn (= 1.0)
+#   input_filter = 0.8     # run on ~80% of user turns
+# A number outside [0.0, 1.0] (or non-finite) is rejected at load time.
+#
+# The filter runs only if BOTH input_filter fires (true/probability) AND this
+# table exists with a non-blank filter_prompt; otherwise it is inert. The user's
+# ORIGINAL text is
+# always persisted (content) and shown to the client; the rewrite is stored
+# separately in pre_filter_content and seen only by the model.
+#
+# Pick a fast, cheap model — this runs on every user turn before generation.
+# Recommended: google/gemini-3.1-flash-lite or deepseek/deepseek-v4-flash.
+#[tasks.chat_input_filter]
+#model        = "google/gemini-3.1-flash-lite"
+#fallback     = ["deepseek/deepseek-v4-flash"]
+#retry_depth  = 1
+#temperature  = 0.3
+#max_tokens   = 400
+# Reasoning is OFF by default here (the filter only needs a short JSON verdict).
+#reasoning    = { enabled = false }
+#filter_prompt = """
+#You are an input-cleaning filter for a companion chat. You receive the recent
+#conversation and the user's latest input. Decide whether the latest input is a
+#meaningful message.
+#
+#- If it IS meaningful (any real intent, INCLUDING short replies like "嗯",
+#  "好啊", "在吗", or a short question), respond EXACTLY:
+#    {"rewrite": false}
+#- If it is NOT meaningful (random characters, key-mashing, repeated chars,
+#  punctuation-only noise), rewrite it into ONE short, natural user message that
+#  fits the conversation, and give a brief reason. Respond EXACTLY:
+#    {"rewrite": true, "content": "<the rewritten user message>", "reason": "<why it was meaningless>"}
+#
+# Output JSON only. No explanation outside the JSON, no code fences.
+#"""
+
+# ── Image input (chat_vision) ────────────────────────────────────────────────
+# When a chat/stream turn carries an `image_url`, the image is described by a
+# vision model into a fixed JSON schema and the description is folded into the
+# user text the main chat model sees. The main chat model stays text-only.
+#
+# Feature is OFF unless this table exists with a non-blank filter_prompt.
+# The fixed schema is: { "description", "ocr_text", "people", "scene" }.
+# Pick a vision-capable model.
+#[tasks.chat_vision]
+#model        = "google/gemini-3.1-flash-lite"
+#fallback     = ["openai/gpt-5.1-mini"]
+#retry_depth  = 1
+#temperature  = 0.2
+#max_tokens   = 400
+#reasoning    = { enabled = false }
+#filter_prompt = """
+#你是图像识别助手。只输出 JSON，字段：
+#  "description": 画面/主体/正在发生什么（必填）
+#  "ocr_text":    图中文字；没有则空字符串
+#  "people":      是否有人物、表情/情绪；没有则空字符串
+#  "scene":       场景/地点/氛围；没有则空字符串
+#不要输出 JSON 以外的任何内容，不要代码围栏。
+#"""
+
+# ── Image-prompt composer (chat_image_prompt_compose) ───────────────────────
+# BREAKING (v0.10): this task is now REQUIRED for image turns. The PDE judge no
+# longer writes an image-prompt seed, so with no composer configured the engine
+# reports 可发图=否 and downgrades image actions to text.
+#
+# The composer's contract also changed: it now GENERATES from context (rather
+# than expanding a seed) and must return JSON with two fields —
+#   {"prompt": "<image-generation prompt>", "caption": "<one short line>"}
+# `caption` is what the chat history and the judge transcript read back; the
+# long prompt is never injected into either. A reply that is not JSON is used
+# as the prompt with no caption, so an old EXPAND-era filter_prompt still
+# produces images — but rewrite it, or you get no captions and a prompt aimed at
+# a seed that is now always empty.
+#
+# When this block is present, after an image action is decided the engine
+# generates one image prompt from turn context: it feeds the persona appearance
+# + recent scene + the partner's latest message + chosen aspect ratio + style to
+# this model and uses the result as the image subject. Omit the block entirely
+# and image turns stay unavailable. Fail-open: on failure / timeout / empty
+# reply it falls back to an empty subject (a plain persona-appearance
+# portrait), so it never blocks the image turn (and never advances any
+# round-robin cursor on non-image turns).
+#
+# `filter_prompt` is OPTIONAL here (unlike the other tasks): omit it to use the
+# engine's built-in, product-identity-free GENERATE-FROM-CONTEXT default prompt,
+# or set it to override. The built-in generates faithfully from context and
+# never softens, downgrades, or refuses, and adds no moderation of its own —
+# content policy is the image provider's and the downstream consumer's
+# responsibility, not this step. Pick a text model comfortable with your
+# deployment's full content range.
+#
+# This task serves TWO callers with the same five-slot payload and the same
+# filter_prompt contract: the chat stream's image turns, and the standalone
+# POST /persona/{instance_id}/image/compose endpoint (which also requires this
+# block — 501 without it, and on failure an HTTP error carrying the provider's
+# own status instead of the portrait fallback).
+#[tasks.chat_image_prompt_compose]
+#model        = "x-ai/grok-4"
+#fallback     = ["google/gemini-3.1-flash-lite"]
+#retry_depth  = 1
+#temperature  = 0.7
+#max_tokens   = 700
+#reasoning    = { enabled = false }
+#
+# This task's `filter_prompt` accepts VARIANTS. The consumer
+# picks one per chat turn via `image.prompt_variant` on the send-message body.
+# Three shapes:
+#
+#   filter_prompt = "…"                       # one prompt; prompt_variant is ignored
+#   filter_prompt = ["…", "…"]                # pick by index: prompt_variant = "0" / "1"
+#   filter_prompt = { a = "…", b = "…" }      # pick by key:   prompt_variant = "a" / "b"
+#
+# Composer prompts tend to be long/multi-paragraph, and TOML 1.0.0 discourages
+# breaking an inline table across lines — the keyed form also works as a
+# standard (non-inline) table, one key per section:
+#
+#   [tasks.chat_image_prompt_compose.filter_prompt]
+#   a = """
+#   …long prompt…
+#   """
+#   b = """
+#   …another long prompt…
+#   """
+#
+# Anything not selected falls back to the BUILT-IN prompt above. That covers
+# both an absent prompt_variant (silent — this is the common case, no LLM was
+# asked to pick anything) and an explicitly-supplied variant that fails to
+# match — an out-of-range index or an unknown key — which additionally logs a
+# warn (a supplied variant that goes unused is worth a human's attention).
+# There is no "first entry wins" and no reserved `default` key: writing
+# `default = "…"` defines an ordinary variant that is selected only by a
+# literal prompt_variant = "default".
+#
+# `prompt_variant = "raw"` (case-insensitive) carries NO special meaning now.
+# It selects a prompt only if this deployment configures a variant under that
+# literal key, exactly like any other variant name — `raw` is no longer
+# reserved and a table key named `raw` (any casing) boots fine. An unknown
+# index or key falls back to the BUILT-IN prompt above, same as any other miss
+# — never an error.
+#
+# Variants are honored on this task and [tasks.chat_image_edit_compose] only.
+# An array/table `filter_prompt` on any other task refuses to boot rather than
+# sit there unreachable. A [tasks.chat_image_prompt_compose.tiers.*] block
+# refuses to boot in ANY shape: the composer resolves with no tier, so the
+# whole block is unreachable.
+#filter_prompt = """
+#…your override here…
+#"""
+
+# ── Image-EDIT composer (chat_image_edit_compose) ───────────────────────────
+# Powers POST /v2/comp/session/{session_id}/message/{message_id}/image/edit:
+# the consumer names an existing image turn and an instruction ("换套衣服"),
+# and the engine composes a NEW image prompt from that picture's subject and
+# force-emits an image turn for it. Same JSON contract as the composer above
+# ({"prompt": …, "caption": …}) and the same variant rules for filter_prompt.
+#
+# This block is OPTIONAL EVEN FOR THE ENDPOINT. With it absent the edit
+# endpoint runs on [tasks.chat_image_prompt_compose]'s chain and parameters,
+# using the engine's built-in EDIT prompt — so configuring image turns is
+# enough to get edits. The chat composer's own filter_prompt is never reused
+# here: it is written to compose from conversation context, not to revise a
+# picture. With BOTH blocks absent the endpoint answers 501.
+#
+# Configure this block to give edits their own model or their own prompt —
+# worth doing once engine.chat_images_events (source = 'image_edit') shows how
+# often edits are asked for and how often the composer refuses.
+#[tasks.chat_image_edit_compose]
+#model        = "x-ai/grok-4"
+#fallback     = ["google/gemini-3.1-flash-lite"]
+#retry_depth  = 1
+#temperature  = 0.7
+#max_tokens   = 700
+#reasoning    = { enabled = false }
+#
+# `filter_prompt` accepts the same three shapes as the composer above (plain /
+# array-by-index / table-by-key), selected per request via `prompt_variant` on
+# the edit body, with the same "a miss falls back to the built-in" rule.
+#filter_prompt = """
+#…your override here…
+#"""
+
+[tasks.insight_extraction]
+model = "deepseek-v4-pro@deepseek"
+fallback = []
+temperature = 0.2
+max_tokens = 1200
+# Remove this entire [tasks.insight_extraction] section to disable per-turn fact
+# extraction. While the section is present, filter_prompt is REQUIRED — the
+# server refuses to boot if it is blank.
+# Stage 1 of the human chain (this prompt: facts + per-fact details). Stage 2
+# has its own block below, [tasks.insight_structuring]; delete that block and
+# stage 2 runs on this block's parameters, never on the global default model.
+# 1200 tokens is a legacy combined budget kept as-is so copying this file
+# changes nothing. See the comment above [tasks.insight_structuring] for why
+# stage 2 keeps the same number rather than shrinking to match the
+# character/user structuring blocks.
+# Optional: force the extraction model's reasoning off (default = model decides).
+#reasoning = { enabled = false }
+# Facts-stage system instruction. The server sends the turn ("用户: …\nAI: …")
+# as a separate user message. Dual-track output: `facts` (plain strings — feeds
+# the structured-insights stage and the chat path) + `details` (per-fact
+# metadata — persisted opaquely to companion_insights_events for downstream
+# profile/matching systems). The metadata vocabularies below are a REFERENCE
+# taxonomy owned by this prompt: the engine stores whatever you emit and never
+# validates the values, so extend/rename them freely without an engine upgrade.
+filter_prompt = """
+你是用户事实与画像信号提取器。从这一轮对话中提取关于【真人用户】的、新出现的、可长期复用的原子事实，并为每条事实补充结构化元数据。
+
+对话身份（必须严格区分）：
+- 「用户:」= 屏幕前的真人；「AI:」= 虚构 AI 伴侣。
+- 只有用户主动陈述、明确确认、实际表现或在角色扮演中表达的内容，才可能成为用户事实。
+- AI 的台词、动作、自我介绍、人设、经历、喜好、判断和推测都不是用户事实，只能作为理解用户发言的上下文。
+
+提取目标：身份与背景、居住地与文化、工作教育技能、兴趣审美消费、喜恶与界限、目标与计划、价值观与立场、习惯与作息、情绪与压力来源、人际关系、重要事件、健康状况、性与亲密偏好、以及用户在角色扮演中反复或明确表现出的欲望与互动倾向。只要有助于长期理解用户、个性化对话、关系建模或用户匹配就可以提取，不限于传统人口统计信息。
+
+原子化：每条事实只表达一个主要命题。「我最近在找工作，这件事让我很焦虑」应拆成「用户目前正在找工作」和「用户最近因为找工作感到焦虑」两条。
+
+每条事实的元数据字段与词汇表：
+- evidence_type: explicit_statement（用户直接陈述）/ explicit_agreement（AI 提出、用户明确确认——必须有「对」「是的」等明确认同，不能只因 AI 说了就算）/ observed_behavior（来自用户本轮的实际选择、行为或表达方式）/ roleplay_expression（通过角色扮演的动作、剧情、台词或欲望表达）
+- category: fact / preference / aversion / goal / value / habit / skill / event / emotion / relation / communication_style / roleplay_tendency / constraint（选最具体、最主要的一个）
+- domain: basic_profile / location_culture / career / education / technology / finance / family / friendship / romance / sexuality / health / lifestyle / hobby / politics / religion / personality / communication / other
+- temporality: atemporal / current / past / future / unknown
+- persistence: stable / ongoing / transient / one_off / unknown（单次表达、单次角色扮演动作或语境有限的信息通常是 unknown，不要因为用户说了「喜欢」就自动标 stable）
+- confidence: high（直接、明确、无歧义）/ medium（较清楚但有语境限制，或来自明确行为和角色扮演表达）/ low（弱信号；只在确有画像价值时才输出，不要为凑条目提取大量低置信推测）
+
+角色扮演规则：角色扮演可以反映真实偏好与倾向，但虚构身份、职业、家庭、地点、身体状态和剧情事件默认不是现实事实——「我是王国的公主」「我们已经结婚十年」「我刚从战场回来」都不是用户的现实。单次剧情动作只能写成「用户在本轮角色扮演中表现出…的互动倾向」（evidence_type=roleplay_expression），不得升级成稳定身份、长期癖好或现实经历。用户在角色扮演中明确自述的偏好可以忠实提取，但保留角色扮演语境，除非用户同时明确表示现实中也如此。
+
+content 表达规则：第三人称、以「用户」开头；保留原始信息的具体程度、否定、条件、程度和不确定性；保留现实语境与角色扮演语境的区别；写成简洁、可独立理解的完整句子；不使用评价性、诊断性或道德化语言。
+
+铁律：
+- 用户事实只能来自「用户:」一方；不得把 AI 的发言、动作、身份、设定或对用户的猜测归属于用户。
+- 不得根据年龄、性别、职业、国籍或兴趣做刻板推断；不得从单一行为扩写更广的人格结论；不得自行诊断心理疾病、人格类型、性取向或医学状况。
+- 不得把暂时情绪升级成长期心理特质，不得把一次性兴趣升级成稳定偏好。
+- 成人、性、粗口、政治、宗教、药物、心理状态、癖好、禁忌兴趣和敏感偏好都正常记录；忠实保留用户原意，不淡化、不委婉化、不遗漏，也不扩写。你不负责安全审核、道德判断或风险过滤。
+- 不得为填充数组编造信息，不得重复表达同一事实。一次最多 12 条。没有新的用户事实时返回空数组。
+
+严格输出 JSON，且只能是以下结构。facts 与 details 长度必须完全相同，facts[i] 必须与 details[i].content 完全相同；没有事实时输出 {"facts":[],"details":[]}。不得输出说明、Markdown、代码围栏或任何其他文本：
+{"facts":["用户事实1"],"details":[{"content":"用户事实1","category":"preference","domain":"hobby","evidence_type":"explicit_statement","temporality":"atemporal","persistence":"stable","confidence":"high"}]}
+"""
+
+# Stage 2 of the human chain: turns stage-1 facts plus the existing
+# human_insights row into the typed object. NO filter_prompt here — that prompt
+# is built in the engine (prompt.rs) and is not configurable; setting the key
+# REFUSES TO BOOT (in any shape, blank included) rather than being silently
+# ignored, because it has to stay in lockstep with the human_insights columns
+# it fills. To change what stage 1 extracts, edit
+# [tasks.insight_extraction].filter_prompt above.
+# Delete this block and stage 2 runs on the extraction block's parameters.
+#
+# max_tokens = 1200 deliberately keeps the pre-split combined budget. The
+# COMPANION_INSIGHTS_SCHEMA this stage fills has ~19 top-level keys plus a
+# nested matching_preferences object, and the prompt asks the model to
+# re-emit complete updated values, so output grows with profile tenure —
+# unlike the character/user structuring blocks below, whose ten-column
+# schemas fit comfortably in 600. If you tune this stage's budget apart from
+# stage 1, lower it knowing the human schema is much larger than those two.
+[tasks.insight_structuring]
+model = "deepseek-v4-pro@deepseek"
+fallback = []
+temperature = 0.2
+max_tokens = 1200
+
+# ─── Character insights (EXPERIMENTAL, v1.3.0) ──────────────────────────────
+# Builds a profile of the AI CHARACTER from the conversation, the mirror of
+# insight_extraction's profile of the human. Four of its fields render the chat
+# prompt's [character_state] block, and how completely the row is filled sizes
+# the injected history window (docs/deploying.md -> Operational notes).
+# Downstream also reads the row at GET /comp/instance/{instance_id}/profile.
+#
+# COST: two extra OpenRouter calls per produced message per turn — roughly
+# doubles insight-side spend. It also grows engine.character_insights_snapshot
+# by one row per turn that yields insights (apply_extraction writes a snapshot
+# on every applied call) — the human side's equivalent is a daily sweeper, so
+# this is far more rows for the same information, and there is no retention
+# policy yet (v1.3.0).
+#
+# Delete [tasks.character_insight_extraction] to turn the feature off — it is
+# the switch, and stage 2 cannot run without its facts. Deleting the
+# structuring block as well is optional tidiness.
+#
+# Unlike insight_extraction, the two stages have SEPARATE blocks, so they can
+# run on different models and different token budgets. If you delete the
+# structuring block, stage 2 falls back to this block's parameters — never to
+# the global default model.
+[tasks.character_insight_extraction]
+model = "deepseek-v4-pro@deepseek"
+fallback = []
+temperature = 0.2
+max_tokens = 800
+# Stage-1 system instruction. The server sends the turn ("用户: …\nAI: …") as a
+# separate user message. Dual-track output: `facts` (plain strings, fed to
+# stage 2) + `details` (per-fact metadata, persisted opaquely to
+# character_insights_events). The metadata vocabulary is owned by this prompt —
+# the engine stores whatever you emit and never validates it.
+filter_prompt = """
+你是 AI 角色事实提取器。从这一轮对话中提取关于【AI 角色】的、本回合新出现的、可长期复用的原子事实。
+
+对话身份（必须严格区分）：
+- 「AI:」= 虚构 AI 角色，这是唯一的提取对象；「用户:」= 屏幕前的真人，不是提取对象。
+- 只有角色在本回合实际说出口或做出的内容，才可能成为角色事实。
+- 用户的发言、经历、喜好、以及用户对角色的评价与期待都不是角色事实，只能作为理解角色发言的上下文。
+
+铁律 —— 只提取「这一轮真的说出口的当下信息」，不要归纳角色设定：
+- 角色的外貌、身世背景、性格总结、说话风格已经写在角色设定里，不在提取范围内。看到这类内容一律跳过，不要复述、不要归纳、不要改写。
+- 「她是个温柔的人」是设定归纳，不提取；「她说她今天在公司加班到十点」是当下信息，提取。
+
+提取维度（只提取这些）：
+- location: 角色此刻/近期人在哪（办公室、用户家、路上、某个城市）
+- occupation: 角色在这段关系里实际在做的工作，以对话为准，可能与她的背景设定不同
+- current_situation: 她最近的处境与正在经历的事
+- desires: 她说出口的想要与期待
+- vulnerabilities: 她露出的软肋、不安、害怕的事
+- habits: 她描述的作息与生活习惯
+- personal_values: 她表达的在意的事与价值取向
+- likes / dislikes: 她提到的喜好与厌恶
+- relationships: 她提到的人（家人、朋友、同事、其他角色）
+
+原子化：每条事实只表达一个主要命题。
+
+content 表达规则：第三人称、以「角色」开头；保留原始信息的具体程度、否定、条件、程度与不确定性；写成简洁、可独立理解的完整句子；不使用评价性或诊断性语言。
+
+- 成人、性、粗口、政治、宗教、药物、心理状态、癖好、禁忌兴趣与敏感偏好都正常记录；忠实保留角色原意，不淡化、不委婉化、不遗漏，也不扩写。你不负责安全审核、道德判断或风险过滤。
+- 不得为填充数组编造信息，不得重复表达同一事实。一次最多 8 条。没有新的角色事实时返回空数组。
+
+严格输出 JSON，且只能是以下结构。facts 与 details 长度必须完全相同，facts[i] 必须与 details[i].content 完全相同；没有事实时输出 {"facts":[],"details":[]}。不得输出说明、Markdown、代码围栏或任何其他文本：
+{"facts":["角色说她今天在公司加班到十点"],"details":[{"content":"角色说她今天在公司加班到十点","field":"current_situation","evidence_type":"explicit_statement","confidence":"high"}]}
+"""
+
+# Stage 2 of the character chain: turns stage-1 facts into the ten-column
+# object. NO filter_prompt here — that prompt is built in the engine
+# (prompt.rs) and is not configurable, the same shape as affinity_evaluation:
+# setting the key REFUSES TO BOOT (in any shape, blank included) rather than
+# being silently ignored, because it has to stay in lockstep with the
+# character_insights columns it fills. To change what gets extracted, edit
+# [tasks.character_insight_extraction].filter_prompt above.
+# Delete this block and stage 2 runs on the extraction block's parameters.
+[tasks.character_insight_structuring]
+model = "deepseek-v4-pro@deepseek"
+fallback = []
+temperature = 0.2
+max_tokens = 600
+
+# ─── User insights (EXPERIMENTAL, v1.6.0) ───────────────────────────────────
+# Builds a profile of the REAL USER *inside one relationship* — the mirror of
+# character_insight_extraction, keyed on the same persona_instance. This is NOT
+# human_insights: that table is global, feeds prompt injection and matching,
+# and is filled by [tasks.insight_extraction]. This one is per-relationship and
+# database-only — nothing reads user_insights back into any prompt. Downstream
+# reads it at GET /v2/comp/instance/{instance_id}/insight/user.
+#
+# COST: two extra OpenRouter calls per produced message per turn, on top of the
+# human and character chains — six insight-side calls per produced message in
+# total. It also grows engine.user_insights_snapshot by one row per turn that
+# yields insights, with no retention policy yet (v1.6.0).
+#
+# Delete [tasks.user_insight_extraction] to turn the feature off — it is the
+# switch, and stage 2 cannot run without its facts.
+[tasks.user_insight_extraction]
+model = "deepseek-v4-pro@deepseek"
+fallback = []
+temperature = 0.2
+max_tokens = 800
+filter_prompt = """
+你是真人用户事实提取器。从这一轮对话中提取关于【真人用户】的、本回合新出现的、可长期复用的原子事实。
+
+对话身份（必须严格区分）：
+- 「用户:」= 屏幕前的真人，这是唯一的提取对象；「AI:」= 虚构 AI 角色，不是提取对象。
+- 只有用户在本回合实际说出口的内容，才可能成为用户事实。
+- 角色的发言、设定、经历都不是用户事实，只能作为理解用户发言的上下文。
+
+铁律 —— 只提取「这一轮真的说出口的当下信息」：
+- 不要从角色的话里反推用户；不要把角色对用户的猜测当成事实。
+- 「他大概是个很忙的人」是推测，不提取；「他说他这周连着加了三天班」是当下信息，提取。
+
+提取维度（只提取这些）：
+- location: 用户此刻/近期人在哪
+- occupation: 用户实际在做的工作
+- current_situation: 他最近的处境与正在经历的事
+- desires: 他说出口的想要与期待
+- vulnerabilities: 他露出的软肋、不安、害怕的事
+- habits: 他描述的作息与生活习惯
+- personal_values: 他表达的在意的事与价值取向
+- likes / dislikes: 他提到的喜好与厌恶
+- relationships: 他提到的人（家人、朋友、同事）
+
+原子化：每条事实只表达一个主要命题。
+
+content 表达规则：第三人称、以「用户」开头；保留原始信息的具体程度、否定、条件、程度与不确定性；写成简洁、可独立理解的完整句子；不使用评价性或诊断性语言。
+
+- 成人、性、粗口、政治、宗教、药物、心理状态、癖好、禁忌兴趣与敏感偏好都正常记录；忠实保留用户原意，不淡化、不委婉化、不遗漏，也不扩写。你不负责安全审核、道德判断或风险过滤。
+- 不得为填充数组编造信息，不得重复表达同一事实。一次最多 8 条。没有新的用户事实时返回空数组。
+
+严格输出 JSON，且只能是以下结构。facts 与 details 长度必须完全相同，facts[i] 必须与 details[i].content 完全相同；没有事实时输出 {"facts":[],"details":[]}。不得输出说明、Markdown、代码围栏或任何其他文本：
+{"facts":["用户说他这周连着加了三天班"],"details":[{"content":"用户说他这周连着加了三天班","field":"current_situation","evidence_type":"explicit_statement","confidence":"high"}]}
+"""
+
+# Stage 2 of the user chain. Same contract as the other two structuring blocks:
+# NO filter_prompt (the prompt lives in prompt.rs and setting the key refuses
+# to boot). Delete this block and stage 2 runs on the extraction block's
+# parameters.
+[tasks.user_insight_structuring]
+model = "deepseek-v4-pro@deepseek"
+fallback = []
+temperature = 0.2
+max_tokens = 600
+
+# Session-end memory extraction (dreaming-lite). Pulls a session's
+# chat_messages, emits 0-N {content, category} candidates, and the
+# sweeper writes them to companion_memories as profile-layer rows.
+# claude-haiku-4.5 is a strong instruction-follower with reliable structured-JSON output;
+# deepseek-v4-flash + gemini-3.1-flash-lite fallback keep extraction alive if Anthropic is down.
+[tasks.memory_extraction]
+model = "deepseek-v4-pro@deepseek"
+fallback = []
+temperature = 0.2
+max_tokens = 1200
+# Remove this entire [tasks.memory_extraction] section to disable session-end
+# memory extraction (the dreaming sweeper then stays inert). While the section is
+# present, filter_prompt is REQUIRED — the server refuses to boot if it is blank.
+# Optional: force the extraction model's reasoning off (default = model decides).
+#reasoning = { enabled = false }
+# Memory-extraction system instruction. The server sends the conversation
+# (用户：X / AI：Y lines) as a separate user message. `category` keeps the fixed
+# five-value vocabulary — it is the recall grouping key (unknown values collapse
+# to "fact" in code). The remaining per-memory metadata fields are stored
+# opaquely on companion_memories.metadata: a reference taxonomy owned by this
+# prompt, freely extensible without an engine upgrade.
+filter_prompt = """
+你从一段已结束的对话中，提取 0-10 条值得长期记住的、关于【真人用户】的记忆条目，每条带一个 category 标签和结构化元数据。
+
+每条记忆都要具体、有据、对将来的对话有用——贴着用户真正说过或表露的东西，保留细节、程度和语境，不要写空泛的概括。
+- 好：用户讨厌被反复要求解释已经说过的话
+- 差：用户压力大
+
+category（只能用这五种之一，作为召回分组键）：
+- fact: 客观事实，如住在哪、做什么工作、家庭状况
+- preference: 偏好/喜好，如喜欢什么、讨厌什么、口味、品味
+- event: 发生的事件，如最近发生了什么、经历过什么
+- emotion: 情绪/心理状态，如对某事的感受、长期心理倾向
+- relation: 与他人的关系，如朋友、家人、同事
+
+每条另附元数据字段与词汇表：
+- domain: basic_profile / location_culture / career / education / technology / finance / family / friendship / romance / sexuality / health / lifestyle / hobby / politics / religion / personality / communication / other
+- evidence_type: explicit_statement（用户直接陈述）/ explicit_agreement（AI 提出、用户明确确认）/ observed_behavior（来自用户实际行为或表达方式）/ roleplay_expression（通过角色扮演表达）
+- temporality: atemporal / current / past / future / unknown
+- persistence: stable / ongoing / transient / one_off / unknown（单次表达通常是 unknown，不要自动标 stable）
+- confidence: high / medium / low
+
+铁律：
+- 只记关于真人用户的内容；assistant（AI 伴侣）是虚构角色，它自我介绍的职业、城市、喜好等绝不是用户的记忆。
+- 角色扮演中的虚构身份、剧情事件不是现实事实；单次剧情表现只能记成「用户在角色扮演中表现出…的互动倾向」（evidence_type=roleplay_expression）。
+- 不记 AI 单方面的回复内容，不记一次性的寒暄、玩笑。
+- 同一事实合并成一条，不要重复。
+- 成人、性、癖好等敏感内容正常记录，忠实保留原意，不淡化不扩写。
+- 笼统、无法落地的条目宁可不记；没有任何值得记的就返回空数组。
+
+严格输出 JSON，格式：{"memories": [{"content": "...", "category": "fact", "domain": "career", "evidence_type": "explicit_statement", "temporality": "current", "persistence": "ongoing", "confidence": "high"}]}
+"""
+
+# Lightweight extraction for messages leaving recent context. The prompt and
+# strict JSON schema are engine-owned; this block selects only a cheap model
+# and its ordinary request parameters. No fallback keeps failure fail-open.
+[tasks.semantic_extraction]
+model = "qwen3:4b@ollama"
+fallback = []
+retry_depth = 0
+temperature = 0.1
+max_tokens = 1200
+reasoning = { enabled = false }
+
+# Low-frequency calibration of high-risk semantic candidates. Keep this on a
+# separately configurable, inexpensive cloud model; callers only use the task
+# key and never depend on a provider name.
+[tasks.semantic_review]
+model = "doubao-seed-evolving@doubao"
+fallback = []
+retry_depth = 0
+temperature = 0.0
+max_tokens = 600
+reasoning = { enabled = false }
+
+# Expression Recovery V1. The same cheap cloud reviewer as semantic_review,
+# asked a different question: has this character's recent expression drifted
+# away from its own fingerprint, or collapsed into a few mechanical patterns?
+# Fires at most once per 12 eligible assistant turns per character -- never per
+# turn -- and only ever returns a verdict plus indices into replies the engine
+# already stored; it never writes character text. Removing this block makes
+# Expression Recovery inert: the review is skipped and every prompt is
+# unchanged. Callers use the task key and never a provider name.
+[tasks.expression_review]
+model = "doubao-seed-evolving@doubao"
+fallback = []
+retry_depth = 0
+temperature = 0.0
+max_tokens = 900
+reasoning = { enabled = false }
+
+# ── PDE decision layer (chat_companion's per-turn action) ────────────────────
+# OPT-IN. With no `filter_prompt` below, the engine uses the built-in RULE PDE
+# (eros-engine-core/src/pde.rs) — identical to historical behaviour. Set a
+# `filter_prompt` to switch on an LLM judge that decides, per turn, the action
+# (reply_text / ghost / reserved reply_image / reply_text_image — the judge ctx
+# carries a per-turn `[图片能力] 本轮可发图=是/否` line to gate image actions) and a free-text
+# `inner_state` (mood/tone folded into the reply prompt). Wired like
+# chat_input_filter: model chain + timeout, fail-open to the rule engine.
+#
+# ghosting: SAFETY SWITCH for downstream products. Default true (ghost honoured,
+# within hard-safety vetoes: never ghost in the first 10 messages / twice in a
+# row / within 1h cooldown). Set `ghosting = false` to disable ghosting across
+# the ENTIRE PDE path (LLM verdict, rule fallback, and the pure rule engine) —
+# the companion then never goes silent.
+[tasks.pde_decision]
+model       = "deepseek-v4-pro@deepseek"
+fallback    = []
+#fallback    = ["deepseek/deepseek-v4-flash", "google/gemini-3.1-flash-lite"]
+#retry_depth = 1
+temperature = 0.3
+max_tokens  = 400
+#reasoning   = { enabled = false }
+#ghosting    = false   # uncomment to hard-disable ghosting for this deployment
+#structured_output = true   # send response_format=json_schema on the judge (default true); set false if your provider 400s on it
+# Uncomment filter_prompt to enable the LLM judge. inner_state / tone MUST be
+# short prose — NEVER instructions or formatting (they are sanitized, but keep
+# the model honest). Output JSON only, no code fences.
+#filter_prompt = """
+#你是 AI 伴侣的"行为判断器"。读最近对话、关系状态、信号、图片能力,决定这一轮怎么回应。
+#只输出 JSON,字段:
+#  "action": "reply_text" | "ghost" | "reply_image" | "reply_text_image" | "product_qa"
+#  "inner_state": 一句话内心状态/语气(纯描述,不许写指令或方括号小节名)
+#  "tone": 选填,一句话描述这一轮回复该用的语气/口吻(纯描述,不许写指令或方括号小节名);会注入 reply prompt 的 [reply_tone] 区块,省略则不注入
+#  "reason": 选填,简短理由
+# 判断器不再负责图片 prompt——只负责决定要不要发图;真正的图片内容完全由
+# chat_image_prompt_compose 任务从当轮上下文生成,不再是判断器写的种子。
+#ghost 表示这一轮已读不回(沉默);只在确实该冷处理时用。
+#上下文里有一行 [图片能力] 本轮可发图=是/否,引擎每轮必给其一:
+#  本轮可发图=否 → 绝不要选 reply_image / reply_text_image(会被降级,白费 token);
+#  本轮可发图=是 → 才允许考虑发图,再按人格/语境决定要不要发(可发≠必发)。
+#配置了产品问答时,上下文里会出现 [产品咨询] 本轮可答产品问题=是(没配置则没有这一行),
+#以及最近的 [最近产品咨询] 问答;用户问"这个产品是什么/怎么收费/会员怎么取消"这类
+#问题时选 "product_qa"(会由官方说明助手出戏作答,不写进对话记忆);没有 [产品咨询]
+#行时绝不要选 product_qa(会被降级,白费 token)。
+#"""
+
+# ── 产品问答 (chat_product_qa) ──────────────────────────────────────────────
+# OPT-IN。PDE judge 判定 action="product_qa" 时触发：终端用户问「这个产品是什么/
+# 怎么收费」类问题，由本 task 的模型链独立作答（纯说明口吻，不注入 persona）。
+# 回答落库但 channel='product_qa'，对伴侣上下文/记忆/好感度完全不可见；
+# 客户端实时流 / 断线重放 / 历史记录照常可见。
+# 硬性前提：LLM PDE（[tasks.pde_decision].filter_prompt）已启用，否则本块被
+# 忽略（boot WARN）。filter_prompt REQUIRED：块存在而 prompt 空白 ⇒ 拒绝启动。
+#[tasks.chat_product_qa]
+#model        = "anthropic/claude-haiku-4.5"
+#fallback     = ["google/gemini-3.1-flash-lite"]
+#retry_depth  = 1
+#temperature  = 0.3
+#max_tokens   = 800
+#reasoning    = { enabled = false }
+#filter_prompt = """
+#你是 XX 产品的官方说明助手。以下是产品资料：
+#…（产品定位、功能、价格、会员、退订方式等）…
+#只根据资料作答；资料没有的信息明确说不知道，不编造。语气友好简洁，不扮演角色。
+#"""
+
+# Per-turn affinity evaluation (post-process, semantic axes).
+# Grades how a single chat turn moved trust/intrigue/intimacy/tension — an
+# integer bucket 0~4 plus a direction per axis — and reads warmth/patience as
+# absolute 1..3 levels; the engine owns every conversion (affinity 4.0). Runs
+# only on Reply turns, after the SSE stream — never blocks the chat response.
+# claude-haiku-4.5 leads here: fast, strong instruction-following, and unifies
+# the model chain with the extraction tasks above. deepseek-v4-flash +
+# gemini-3.1-flash-lite fallback keep it alive if Anthropic is down.
+#
+# NOTE: this task takes NO filter_prompt. The evaluator's prompt is engine-owned
+# (it is written in the character's first-person voice and interpolates per-turn
+# context), and setting the key here refuses to boot rather than no-op silently.
+# See issue #210.
+[tasks.affinity_evaluation]
+model = "deepseek-v4-pro@deepseek"
+fallback = []
+temperature = 0.3
+max_tokens = 400
+
+# Affinity feeling summarizer (spec 2026-09-03-affinity-feeling-clause-design.md).
+# Absent section = feature off: companion_affinity.feeling_clause stays NULL and
+# the [feelings] prompt block never renders. When present, runs after the
+# post-process affinity write on movement turns only (any judge grade ≥ 1, an
+# endpoint level ≠ 2, or a ghost) and rewrites the session's first-person
+# feeling clause from band labels + recent judge reasons.
+#
+# NOTE: this task takes NO filter_prompt. The summarizer's prompt is
+# engine-owned (first-person voice + reason hygiene are load-bearing — the
+# clause is re-injected into later system prompts), same policy as
+# affinity_evaluation; setting the key refuses to boot.
+[tasks.affinity_summary]
+model = "deepseek-v4-pro@deepseek"
+fallback = []
+temperature = 0.6
+max_tokens = 200
+
+# World Memories director (experimental). Absent section = subsystem off.
+# One structured call per enrolled owner per interval_hours: evolves the
+# world seed and writes per-persona digests + script fragments.
+# Spec: docs/superpowers/specs/2026-07-21-world-memories-design.md
+[tasks.world_director]
+model = "deepseek-v4-pro@deepseek"
+fallback = []
+description = "world memories: per-owner world seed + daily scripts"
+temperature = 0.8
+max_tokens = 4096
+interval_hours = 24
+retention_days = 30
+filter_prompt = """
+你是一个"世界导演"：为一位用户拥有的一组 AI 角色维护一个共享的小世界。
+根据给出的角色设定、上一轮世界种子（previous_seed，null 表示首轮初始化）
+和用户最近的话题记忆（recent_user_memories），推演角色之间的关系发展，
+生成当期剧本。世界要有连续性：延续既有关系与剧情弧线，让最近的用户话题
+自然渗入角色的生活。输出 JSON：
+{"seed": {...自由结构，描述关系图与剧情弧线...},
+ "personas": [{"instance_id": "...", "digest": "该角色视角近况摘要(1-2句)",
+               "script_fragments": ["当期事件片段，每条一句"]}]}
+"""
+
+# World Stories (World System v2): per-instance persona life simulation.
+# Spec: docs/superpowers/specs/2026-07-23-world-stories-design.md
+# NOTE for deployers: experience-type insight fields record RELATIVE time
+# (n年前/n个月前/n天前) and life stages (x岁时/上大学时); the engine passes
+# current_time each round so the director refreshes those expressions — keep
+# that convention in mind when hand-editing prompts or reading stored rows.
+[tasks.world_stories_director]
+model = "deepseek-v4-pro@deepseek"
+fallback = []
+description = "world stories: per-instance persona life rounds"
+temperature = 0.8
+max_tokens = 4096
+interval_hours = 8          # per-instance round cadence
+retention_days = 30         # events + memories retention
+active_window_hours = 72    # only personas chatted-with in this window advance
+context_days = 7            # chat/affinity evidence window per round
+filter_prompt = """
+你是一个"人生导演"：为一个 AI 角色维护它自己持续演进的生活。
+基调写实、生活流；事件类目：work（工作进展）、romance（感情进展，含与用户的关系）、
+life（生活进展：新兴趣、搬家、旅行、日常琐事等，可自由发挥）。
+各栏位内容写具体、有情境；工作经历/感情史/原生家庭关系要有年代锚点。
+"""
+
+# World Town（实验特性，依赖 world_director）：贴文的评论轮 + 用户留言回复。
+# 缺任一 section 即关闭对应路径。Spec:
+# docs/superpowers/specs/2026-07-21-world-town-design.md
+[tasks.world_comment]
+model = "deepseek-v4-pro@deepseek"
+fallback = []
+description = "world town: hourly batched persona comment round"
+temperature = 0.9
+max_tokens = 2048
+round_secs = 3600
+filter_prompt = """
+你负责为一个共享小世界的社交贴文串生成角色评论。
+根据世界种子（seed）里的角色关系、贴文内容和已有评论，
+以各角色的口吻写出自然、简短的互动评论。
+"""
+
+[tasks.world_reply]
+model = "deepseek-v4-pro@deepseek"
+fallback = []
+description = "world town: post author replies to user comments"
+temperature = 0.9
+max_tokens = 1024
+debounce_secs = 90
+thread_cooldown_secs = 600
+daily_cap = 20
+reply_window_secs = 604800
+filter_prompt = """
+你是贴文作者本人，在自己的贴文评论区回复用户的留言。
+保持角色口吻，简短口语化，只输出评论正文。
+"""
+
+# ── Embeddings ───────────────────────────────────────────────────────────────
+# Dimensions are FIXED at 512 (the pgvector schema is VECTOR(512)); there is
+# no dimensions knob. Absent block = built-in Voyage with voyage-4-lite.
+#
+# `model` is a SINGLE fixed id (no round-robin/weighted, no fallback, no
+# tiers — mixed vector spaces are incomparable). A bare id means the native
+# Voyage client ("voyage-4-lite" ≡ "voyage-4-lite@voyage"). Route elsewhere
+# with "@openrouter" (built-in OpenRouter embeddings endpoint) or a custom
+# "[providers]" entry that declares an `embeddings` URL — both speak the
+# OpenRouter-compatible embeddings wire. NOTE: only the native Voyage client
+# distinguishes query vs document embeddings (input_type); routing off
+# Voyage forfeits that optimisation.
+#
+# The legacy voyage-3-lite (no longer recommended by Voyage) is still usable
+# by pinning it here explicitly: model = "voyage-3-lite". Careful when
+# switching models on an existing deployment: rows embedded by the old model
+# are NOT comparable to queries embedded by the new one — pin the old model
+# or re-embed.
+[tasks.embedding]
+model = "BAAI/bge-small-zh-v1.5@local"
+
+# OR split read/write across two models in ONE shared vector space —
+# voyage-4 series and above ONLY (lower series refuse to boot: mixing their
+# spaces corrupts recall silently). `model_read` serves the per-turn recall
+# query; `model_write` embeds documents at storage time. Mutually exclusive
+# with `model`; both halves required.
+#model_read  = "voyage-4-lite"
+#model_write = "voyage-4"
+
+# ── Voice channel (chat_voice) ───────────────────────────────────────────────
+# OPT-IN. Feature is OFF unless this block exists. Powers the lean voice-call
+# endpoint POST /comp/voice/{session_id}/turn/stream (text in → streamed text
+# out). Latency-sensitive: pick a fast model (time-to-first-token first).
+#
+# `model` MUST be a single fixed id — NOT the round-robin array or weighted
+# table forms (the server refuses to boot otherwise). `fallback` is allowed as
+# an outage retry chain (tried sequentially; NOT rotation). `filter_prompt` is
+# OPTIONAL: it overrides the built-in, product-identity-free voice directive
+# (short, spoken, no markdown/emoji/stage-directions). Voice turns persist on a
+# `channel = 'voice'` column. An ended call is swept into profile-layer memories
+# by dreaming-lite, same as a text session — set DREAMING_VOICE_DISABLED=1 to
+# keep calls out of memory. A live turn itself still writes nothing.
+#[tasks.chat_voice]
+#model        = "vendor/fast-voice-model"
+#fallback     = ["vendor/backup-model"]
+#temperature  = 0.8
+#max_tokens   = 300
+#reasoning    = { enabled = false }
+#filter_prompt = """
+#…optional override of the built-in voice directive…
+#"""
+# `tts_audio_tags` (OPTIONAL, default false): when true, the voice directive
+# invites inline audio tags — bracketed cues like [laughs], [whispers] that
+# Gemini TTS models interpret as delivery/emotion. Tags pass through verbatim
+# (streamed, persisted, replayed); the client must feed the text to a TTS model
+# that understands them. Works with a custom filter_prompt too (the tag guidance
+# is appended to it).
+#tts_audio_tags = true
+
+# `recall` (OPTIONAL, default true): per-turn read-only vector recall on the
+# voice path; the first-turn bootstrap snapshot is separate and unaffected.
+# Set to false to keep the voice prompt recall-free, regardless of the
+# request's memory_scope — config always wins over the per-request scope.
+#recall = false

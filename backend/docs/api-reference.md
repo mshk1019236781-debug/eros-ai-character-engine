@@ -1,0 +1,1559 @@
+# API reference
+
+[English](api-reference.md) · [中文](api-reference.zh.md)
+
+A live, browsable reference is at **`/docs`** on any running instance (Scalar UI generated from utoipa annotations).
+
+This page is a hand-written summary of the endpoints worth knowing. The Scalar UI is the authoritative spec.
+
+## Authentication
+
+Every `/comp/*` and `/bff/v1/*` endpoint requires `Authorization: Bearer <Supabase JWT>`. The token's `alg` header selects the validator: asymmetric signatures (ES256/RS256/EdDSA) are checked against the project's JWKS, resolved from `SUPABASE_JWKS_URL` or derived from `SUPABASE_URL` — this is the default for Supabase projects since the 2025 JWT Signing Keys rollout. Legacy HS256 against a shared `SUPABASE_JWT_SECRET` is still accepted for deployments that have not migrated; at least one of the two sources must be configured or the server fails to boot. The `sub` claim must be a UUID; that becomes the user_id for the request.
+
+`/healthz` and `/docs` are public.
+
+## Public endpoints
+
+### `GET /healthz`
+
+Liveness. No auth.
+
+```bash
+curl http://localhost:8080/healthz
+```
+
+```json
+{
+  "status": "ok",
+  "service": "eros-engine",
+  "version": "1.0.x",
+  "timestamp": "2026-05-05T19:06:05.309302232+00:00"
+}
+```
+
+`version` is the running build's crate version (compiled in from `CARGO_PKG_VERSION`), so it tracks the deployed release.
+
+## Chat lifecycle
+
+### `POST /comp/chat/start`
+
+Open a new chat session against a persona genome. The server creates a `persona_instance` for `(genome_id, jwt_user_id)` if it doesn't already exist, then a `chat_session` referencing that instance.
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"genome_id":"11d6a45a-1fd9-4fe6-a943-3f049035eb68"}' \
+  http://localhost:8080/comp/chat/start
+```
+
+```json
+{
+  "session_id": "5f7e…",
+  "instance_id": "…",
+  "persona_name": "Aria",
+  "is_new": true
+}
+```
+
+`is_new=false` if you call `/start` again with the same `genome_id` for the same user — the engine resumes the existing session rather than creating a duplicate.
+
+Optional `channel` field: `"text"` (default) or `"voice"`. Start/resume is
+channel-scoped — a voice-channel start never resumes a text session (and
+vice versa). Voice clients must obtain their session here with
+`"channel": "voice"` before calling the voice turn endpoint.
+
+Optional `force_new` field: when `true`, skip resume entirely and always
+create a fresh session (`is_new: true`), even if a resumable one exists for
+this user × instance × channel. Default `false`/omitted keeps the normal
+resume-or-create behavior. Recommended for voice calls — start every call
+with `{"channel": "voice", "force_new": true}` so each call gets its own
+session instead of continuing a previous one. `POST /comp/chat/start` has no
+built-in rate limit, so deployments that expose `force_new` may want
+request-level rate limiting downstream.
+
+Optional `instance_id` field: an explicit `persona_instance` id. When absent,
+the server picks (or auto-creates) the user's instance for the supplied
+`genome_id`; `genome_id` is required only when `instance_id` is absent.
+
+Optional `is_demo` field: marks the new session as a demo. Persisted to the
+session's `metadata.is_demo` and read by the affinity pipeline to multiply
+positive judge scores by `AFFINITY_DEMO_BOOST` (default `1.4`), so meters
+move visibly within a demo's turn budget. Ignored when resuming an existing
+session.
+
+### `POST /comp/chat/{session_id}/message/stream`
+
+Streaming chat turn. Returns `text/event-stream` with the
+`meta → delta* → done → final` state machine described in the
+[SSE streaming chat 0.2 design spec](superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md).
+
+The body **must** include `client_msg_id` (26..36 ASCII-printable chars,
+any UUID or ULID). Replays of the same `(session_id, client_msg_id)` within
+24 h reconstruct the original frames from the database without re-calling
+OpenRouter.
+
+```bash
+curl -N -X POST \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{"content":"hi","client_msg_id":"01J3333333333333333333333A"}' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+Sample frames (one JSON object per `data:` line):
+
+```text
+data: {"type":"meta","message_id":"01J...","action_type":"reply","model":"x-ai/grok-4-fast"}
+
+data: {"type":"delta","message_id":"01J...","content":"你好"}
+
+data: {"type":"done","message_id":"01J...","truncated":false,"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16},"generation_id":"gen-abc"}
+
+data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retries_chat":0,"retries_filter":0}
+```
+
+The generation is detached from the connection: if the client disconnects mid-turn, the reply still completes and persists to history (pick it up via history or Supabase Realtime), and a turn that fails after disconnect leaves a `system_error` row. Stream turns are recorded in the same queue table as the async endpoint (single attempt, no background retry).
+
+Frame fields worth noting:
+
+- **`meta`** — `message_id`, `action_type`, `model` (the served model id; may be omitted), and `continues_from` (optional — the previous message id when this turn continues a retry chain). `action_type` is one of `reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa` (a plain-text reply is reported as `reply`, not `reply_text` — there is no `reply_text` on the wire). `product_qa` marks an out-of-character product answer routed by the PDE judge (see [model-config.md](model-config.md)); it is excluded from companion context/memory but reported the same way on both the live stream and replay. Clients must tolerate unknown `action_type` values (new ones may be added without a major-version bump).
+- **`done`** — `truncated`, `usage` (after `OPENROUTER_USAGE_HIDDEN_KEYS` filtering; always present — `null` when not applicable), `generation_id` (OpenRouter id; always present — `null` when not applicable), and `ghost_fallback` (bool; omitted when `false`). `ghost_fallback: true` marks a reply that resolved empty and was delivered as a silent fallback — this is **not** an `action_type=ghost` turn, and it leaves the ghost counters untouched. The cause is recorded on the persisted row's `metadata.fallback_reason`. A turn that promises a photo (`action_type=reply_text_image`) is exempt: an empty text half is an image-only reply, not silence, so it reports `ghost_fallback: false`, carries no `fallback_reason`, and the trailing `image_request` still fires.
+- **`final`** — turn summary: `filtered` (bool — was the reply output-filtered), `prompt_injected` (array of the trait tags that injected this turn, or `null`), `tier` (echo of the request `tier`, or `null`), `retries_chat` (zero-based index of the chat attempt that succeeded), `retries_filter` (index of the filter-model attempt that served), and — since v1.4.0 — `llm_attempts` / `gateway_errors` (both **omitted when empty**; see below). No profile/lead signal rides this frame — `lead_score`, `should_show_cta`, and `agent_training_level` were removed (companion_insights teardown, spec 2026-08-11); read profile state from `GET /comp/user/{user_id}/profile` instead.
+
+**`final.llm_attempts` / `final.gateway_errors` — the non-fatal failure
+channel.** Every LLM attempt that failed this turn, across the five chains
+whose failure changes what you received: the chat model chain, the input
+filter, the output filter, the PDE judge, and the image prompt composer. Both
+keys are omitted entirely when there were none, so a clean turn is byte-identical
+to what you receive today. The element shapes are documented in
+[llm-audit.md](llm-audit.md#failed-attempts-llm_attempts--gateway_errors) — the
+frame serialises the identical structures the audit columns hold.
+
+```text
+data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retries_chat":1,"retries_filter":0,"llm_attempts":[{"task":"chat_companion","model":"x-ai/grok-4.20","http_status":529,"provider_code":"529","message":"code=529: Overloaded"}]}
+```
+
+> **Do not render these as an error.** A turn carrying them may have been served
+> perfectly normally — the example above is a turn whose primary model returned
+> `529` and whose fallback answered, which the user experienced as an ordinary
+> reply. They exist so a consumer can alert and account without the reader
+> seeing anything.
+
+Three cases carry them: a **recovered** turn (a later hop served — the reply is
+real and complete); a **pseudo-ghost** turn (the whole chain exhausted and a
+canned phrase was served as a normal reply, `metadata.fallback_reason =
+"stream_failure"` on the persisted row — to the end user this looks like an
+ordinary short reply, and this frame is the only signal that it is not); and a
+**garble-repaired** turn (`metadata.fallback_reason = "garble_repaired"`, the
+reply salvaged from a garbled hop). `chat_vision` and affinity-eval failures
+never ride this frame by design — both are fail-open and land in their own audit
+tables. A **replayed** turn emits `final` with both lists empty, the same way it
+recomputes `retries_chat` / `tier` / `prompt_injected` rather than reading them
+off the row; query `engine.chat_messages` for a replayed turn's failures.
+
+Concurrent active streams per user are capped at 3. The keep-alive heartbeat
+(`: ping`) is emitted every 15 s so reverse-proxies don't time out the
+idle connection.
+
+Pre-stream errors (HTTP 4xx/5xx before the first SSE byte) carry a JSON
+body with `code`, `message`, `user_message` and — for
+`409 duplicate_in_progress` / `409 duplicate_failed` — an
+`original_user_message_id`. `duplicate_in_progress` means the same
+`(session_id, client_msg_id)` is still generating (back off and re-POST);
+`duplicate_failed` means that turn terminally failed and a same-id retry can
+never succeed — send a fresh `client_msg_id`. See the
+[spec](superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md#13-pre-stream-errors-http-status-json-body)
+for the full code table.
+
+**This endpoint is text-channel only.** A `session_id` belonging to a
+voice-channel session is rejected with `409 wrong_channel` before any row is
+persisted — it writes text-channel messages, and letting them land in a voice
+conversation would interleave both channels in one transcript. Voice turns go
+to [`POST /comp/voice/{session_id}/turn/stream`](#post-compvoicesession_idturnstream)
+instead. The gate mirrors the voice endpoint's, so the two channels are
+symmetric: neither endpoint will write into the other's sessions.
+
+Once the first SSE byte has been written, terminal failures arrive as an
+in-band `error` frame and the stream closes; the HTTP response has already
+committed `200 OK`.
+
+**`error` frame fields.** `code`, `retryable`, `message`, `user_message`, plus —
+since v1.4.0 — `upstream_status` and `provider_code`, both omitted when absent.
+
+```text
+data: {"type":"error","code":"rate_limited","retryable":true,"message":"…","user_message":"…","upstream_status":429,"provider_code":"429"}
+```
+
+`upstream_status` is the provider's own HTTP status, verbatim, and appears only
+when the provider actually answered. A gateway-layer failure (timeout, transport
+drop, decode failure) has no status the provider returned, so both fields are
+absent there. `provider_code` is the provider's own error code when its body
+carried one.
+
+`code` is derived from the failure rather than hardcoded, which brings two values
+alive that were declared and **never constructed** before v1.4.0:
+
+| Failure | `code` |
+|---|---|
+| Provider answered `429` | `rate_limited` **(new)** |
+| Provider answered any other status | `upstream_unavailable` |
+| Gateway `open_timeout` / `total_timeout` / `idle_timeout` | `timeout` **(new)** |
+| Gateway `config` (local misconfiguration) | `internal` |
+| Gateway `transport` / `decode` / `chain_exhausted` | `upstream_unavailable` |
+| Whole-turn generation budget exceeded (`CHAT_QUEUE_GEN_TIMEOUT_SECS`) | `generation_timeout` **(new)** |
+
+Add arms for `rate_limited`, `timeout`, and `generation_timeout`; all three
+carry `retryable: true`, so a default arm that reports a permanent failure is
+now wrong. `generation_timeout` is distinct from `timeout`: `timeout` is a
+single upstream call's own gateway-level deadline, while `generation_timeout`
+is the detached stream task's whole-turn wall-clock budget expiring — it can
+fire even when every individual upstream call so far succeeded, just
+cumulatively too slowly.
+
+**Optional: tier selection.** The body may include a `tier` string —
+type `String`, regex `^[a-z0-9_]{1,32}$` (returns `400` if malformed).
+Selects the per-tier model and `allow_traits` from `model_config.toml`
+(`[tasks.chat_companion.tiers.<tier>]`). An unknown or absent tier falls
+back to the task default block (a warn is logged). Example:
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "hi",
+        "client_msg_id": "01J3333333333333333333333A",
+        "tier": "gold"
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+**Optional: per-request prompt traits.** The body may include a
+`prompt_traits` array — see [prompt-traits.md](prompt-traits.md). Example:
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "hi",
+        "client_msg_id": "01J3333333333333333333333A",
+        "prompt_traits": [
+          {"tag": "nsfw_boost", "text": "<your injection text here>"}
+        ]
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+Limits: ≤ 8 entries, `tag` matches `[a-z0-9_]{1,32}`, `text` ≤ 2000 chars
+(non-blank). Violations return `400 BadRequest` as a pre-stream error.
+
+**Optional: memory injection scope.** The body may include a `memory_scope`
+string to control which memory layers are injected into the prompt. Accepted
+values:
+
+| Value | Injected |
+|-------|----------|
+| `full` | Full user profile (including intimate fields) + relationship memory |
+| `neutral_and_relationship` | Neutral profile (city/occupation/MBTI only) + relationship memory **(default)** |
+| `relationship_only` | Relationship memory only; no profile |
+| `neutral_only` | Neutral profile only; no relationship memory |
+| `insights_only` | Full user profile only (intimate fields included); no relationship memory |
+| `none` | No memory injection |
+
+> **Important (#40 mitigation):** The default `neutral_and_relationship` is
+> intentionally narrower than the pre-#40 behavior (which injected everything).
+> Omitting `memory_scope` is **not** equivalent to the old behavior — it
+> applies the narrowed default. Use `full` explicitly if you need the
+> full-injection behavior.
+
+**Optional: affinity injection scope.** The body may include an
+`affinity_scope` value to control which of the six affinity axes are injected
+into the prompt. Accepted values:
+
+- Named presets: `"bond"` **(default)** — warmth + intimacy + tension;
+  `"chemistry"` — trust + intrigue + patience; `"bond_and_chemistry"` / `"full"` — all six axes; `"none"` — no affinity injection.
+- Axis array: any subset of `["warmth", "trust", "intrigue", "intimacy", "patience", "tension"]`.
+
+> **Important (#40 mitigation):** The default `bond` (3 axes) is intentionally
+> narrower than the pre-#40 behavior (which injected all six axes). Omitting
+> `affinity_scope` is **not** equivalent to the old behavior. Use
+> `"bond_and_chemistry"` or `"full"` explicitly if you need all axes.
+
+> **Since 1.3.0 the field is injection-only again.** The 3.1 write-side
+> steering (1.2.1) is retired: `affinity_scope` gates prompt injection and
+> `length_score` and has no effect on scoring. See
+> [Affinity model → Scope steering: retired](affinity-model.md#scope-steering-retired).
+
+Example using both fields:
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "hi",
+        "client_msg_id": "01J3333333333333333333333A",
+        "memory_scope": "full",
+        "affinity_scope": "bond_and_chemistry"
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+**Optional: quote.** The body may include `reply_to_message_id` — the UUID of a
+`chat_messages` row in this session that this turn replies to. When it
+resolves, the quoted line is rendered into the reply prompt as a `[quote]`
+block (its text, whether the persona or the user said it, and how long ago),
+and the anchor is recorded on the persisted user row's
+`metadata.reply_to_message_id`, from which both history routes echo it back.
+
+**A quote points at one line; it does not rewind the conversation.** The
+history window is the same newest-N with or without it, so quoting something
+from last week costs the model nothing that was said since. A
+present-but-unresolvable id (unknown, or belonging to another session) does not
+fail the request and does not change the context either: the turn simply runs
+without a `[quote]` block, and the row's `metadata.reply_to_error` is set to
+`"not_found"`.
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "wait, about that earlier plan",
+        "client_msg_id": "01J3333333333333333333333A",
+        "reply_to_message_id": "3cc06c53-9d2e-4f8a-b3c1-0a1b2c3d4e5f"
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+**Optional: OpenRouter audit passthrough.** The body may include an
+`audit` object that rides directly to OpenRouter as wire-level `user` /
+`session_id` / `metadata` — see [llm-audit.md](llm-audit.md). Example:
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "hi",
+        "client_msg_id": "01J3333333333333333333333A",
+        "audit": {
+          "user": "u_<hash>",
+          "session_id": "conv_xyz",
+          "metadata": { "feature": "chat", "plan": "pro" }
+        }
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+Caps: `audit.user` and `audit.session_id` ≤ 256 chars; `audit.metadata`
+≤ 16 keys, key matches `[A-Za-z0-9_.-]{1,64}`, value is a string ≤ 512
+chars. Violations return `400 BadRequest` as a pre-stream error.
+
+**Optional: tip.** The body may include `tips_amount_usd` (a finite number,
+`> 0` and `≤ 1_000_000`) to mark this turn as a tip. The turn is persisted with
+`role = gift_user`: if `content` is empty the stored content becomes
+`(打赏 $<amount>)`, otherwise your `content` is kept. The tip amount rides to the
+model so the persona can react in its reply, and it is echoed back on the BFF
+history row (`tips_amount_usd`). A tip and an image cannot be sent on the same
+turn. Replaces the old `POST /comp/chat/{session_id}/event/gift` route, which has
+been removed.
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "",
+        "client_msg_id": "01J3333333333333333333333A",
+        "tips_amount_usd": 9.99
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+**Optional: image input (vision).** The body may include `image_url` — an
+absolute `http(s)` URL with a host, no embedded whitespace, ≤ 2048 chars. When
+present, the engine runs a vision *describe* pre-stage (the `chat_vision` task)
+and feeds the description into the reply. `image_url` and `tips_amount_usd` are
+mutually exclusive on a single turn. A malformed URL returns `422 Unprocessable
+Entity` (`code: "unprocessable"`) as a pre-stream error. Vision is active only
+if `[tasks.chat_vision]` is configured with a non-blank `filter_prompt` (see
+[model-config.md](model-config.md)).
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "what is in this picture?",
+        "client_msg_id": "01J3333333333333333333333A",
+        "image_url": "https://example.com/cat.jpg"
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+**Optional: companion image reply.** The body may include an `image` object —
+`ImageReplyParams` — to request or force a companion-generated image this turn.
+The `image` block is also the per-turn opt-in: **omit it to suppress image
+generation for the turn** (the PDE may then only `reply_text` / `ghost`), or
+send `image: {}` to enable it with the engine's built-in defaults. This lets a caller's own
+per-turn policy gate images independently of the PDE's content decision.
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "give me a smile",
+        "client_msg_id": "01J3333333333333333333333A",
+        "image": {
+          "force": true,
+          "style": "realistic",
+          "aspect_ratio": "3:4"
+        }
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+An `image` block signals the consumer handles image drawing this turn; the
+engine composes the prompt and emits a single `image_request` frame (it never
+draws on the chat stream).
+
+`ImageReplyParams` fields (all optional):
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `force` | `bool` | `false` | Override the PDE decision for this turn — the turn is always `reply_image` (image only, no text reply). Requires `[tasks.chat_image_prompt_compose]` to be configured (`422` otherwise), and `content` follows the ordinary non-empty rule. When `false` the PDE decides. A leftover `mode` key from the pre-1.0.1 contract deserializes and is silently ignored. |
+| `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | One of the three engine-owned style presets; `"realistic"` is the engine's built-in default. |
+| `aspect_ratio` | `String` | none | Allowed: `1:1`, `3:4`, `4:3`, `9:16`, `16:9`; absent when omitted (PDE plan → request → absent). Returns `422` if invalid. |
+| `prompt_variant` | `String` | none | Selects a `[tasks.chat_image_prompt_compose].filter_prompt` variant: an index (`"0"`, `"1"`) or a key (`"a"`, `"b"`), depending on how that task is configured (see [model-config.md](model-config.md)). `"raw"` carries no special meaning: it selects a prompt only if the deployment configures a variant under that literal key, exactly like any other name. An index/key that doesn't match — `"raw"` included — falls back to the engine's built-in composer prompt, never a `422` or other error. Ignored when the task isn't configured, or configures a single plain prompt. |
+
+**Reference selection (`image_ref`).** The PDE verdict carries `image_ref`
+(`"face"` | `"previous"`, default `"face"`) and rides on the `image_request`
+frame (below) — the chat stream never resolves it to a URL itself. The
+`previous`-with-no-image → `face` fallback, and the `face_ref_url` /
+`prev_image_url` reference URLs, belong to the consumer's own image-vendor
+call (the engine has no draw endpoint). The persisted `metadata.image` marker
+records the composer's picture subject, the aspect ratio, and its `caption`
+(the short line the composer returned alongside the prompt, or `None` when it
+gave none — the chat history and the judge transcript read back only the
+caption, never the long prompt), plus — only when the composer LLM call
+succeeded — the audit trio `compose_variant` (the `filter_prompt` key/index
+that was selected, absent for a plain or built-in prompt), `compose_model`,
+and `compose_generation_id`. Absence of the trio means the turn had no
+successful compose (fail-open degradation, or composer not configured). A
+`compose_event_id` pointer is present whenever the audit write itself
+succeeded — independent of whether the compose call did — and is the
+reachable link to `engine.chat_images_events`, where the composed **wire**
+prompt actually lives (the `metadata.image` marker never duplicates it); see
+[LLM audit → Image-path event tables](llm-audit.md#image-path-event-tables).
+The marker also records `image_ref` (`"face"` | `"previous"`), so the full
+`image_request` payload stays recoverable after the fact (absent on rows
+persisted before it was added).
+
+Validation: `force` + `tips_amount_usd` on the same turn → `422`. `force`
+while `[tasks.chat_image_prompt_compose]` is not configured → `422` (the
+composer is the only prompt source; without it a forced image could only be a
+generic portrait). An unsupported `aspect_ratio` returns `422 Unprocessable
+Entity` (`code: "unprocessable"`) as a pre-stream error. All are pre-stream:
+no user row is persisted.
+
+**`image_request` SSE frame** — emitted once per image turn in place of any
+in-engine draw. The engine composes the prompt; the consumer draws it via its
+own image vendor (there is no engine draw endpoint). The chat stream itself
+draws nothing, streams no image bytes, and persists no draw result.
+
+```
+data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e...","image_ref":"face","aspect_ratio":"3:4"}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `type` | `"image_request"` | Frame type discriminator. |
+| `message_id` | `String` | The real assistant `message_id`; key the draw and storage to it. |
+| `composed_prompt` | `String` | base64(`STANDARD`, unwrapped) of the UTF-8 final wire prompt. Decode at the last hop and use verbatim as the provider text prompt — reconstruct no prompt logic. |
+| `image_ref` | `"face"` \| `"previous"` | Which reference image the plan chose; the consumer resolves the actual URL. |
+| `aspect_ratio` | `String` \| absent | The semantic aspect (`1:1`,`3:4`,`4:3`,`9:16`,`16:9`) or absent. The consumer owns aspect→resolution mapping; no width/height is sent. |
+
+**Full SSE frame sequences:**
+
+- image-only: `meta(reply_image) → done → image_request → final`
+- text + image: `meta(reply_text_image) → delta* → done → image_request → final`
+- `ghost`: `meta(action_type=ghost) → done → final` — no `delta`, no `model` in `meta`, `usage` and `generation_id` are `null` in `done`. The companion stayed silent this turn; no LLM was called.
+- `product_qa`: `meta(action_type=product_qa) → delta* → done → final` — same shape as a normal text reply, streamed by an independent model chain (`[tasks.chat_product_qa]`) instead of `chat_companion`; persisted with `channel='product_qa'` and reported as `product_qa` again on replay.
+
+The engine never draws and no draw-lifecycle frames exist: the consumer
+receives `image_request` and calls its own image vendor.
+
+The frame itself is wire-only. A consumer that was not connected when it
+fired — an async turn, or a stream client that disconnected mid-turn — can
+recover the same payload afterwards via
+[`GET /comp/chat/{session_id}/messages/{message_id}/image-request`](#get-compchatsession_idmessagesmessage_idimage-request):
+an image turn is recognizable in history by `metadata.image` on the
+assistant row.
+
+### `POST /v2/comp/session/{session_id}/message/async`
+
+Enqueue-only chat turn — the async alternative to the stream endpoint above,
+for callers that cannot hold an SSE connection open (bot gateways, background
+senders). Same body (`StreamSendRequest`) and the same validation and
+auth/ownership/`wrong_channel` checks as `message/stream` (`client_msg_id` is
+required on both), and no reply is ever returned here: a background worker
+drives the same generation pipeline and the reply lands in
+`engine.chat_messages`, picked up via the history route or Supabase
+Realtime.
+
+The pre-rename path `POST /v2/comp/chat/{session_id}/message/async` was removed in 1.6.0 and now 404s (for an authenticated request; `require_auth` still 401s first) — see [`docs/migrating/v1-6-0-async-chat.md`](migrating/v1-6-0-async-chat.md).
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"content":"hi","client_msg_id":"01J3333333333333333333333A"}' \
+  http://localhost:8080/v2/comp/session/<session_id>/message/async
+```
+
+| Case | Response |
+|---|---|
+| New message enqueued | `202 {"status":"queued","user_message_id":...}` |
+| Redelivery of a still-pending/claimed `client_msg_id` | `202 {"status":"already_queued",...}` |
+| Redelivery of an already-processed `client_msg_id` | `200 {"status":"already_completed",...}` |
+| Redelivery of a terminally failed `client_msg_id` | `200 {"status":"failed",...}` — retry with a fresh `client_msg_id` |
+| Per-session pending depth over `CHAT_QUEUE_PENDING_CAP` | `429 rate_limited` |
+| Other pre-stream failures | same `StreamPreError` shape and codes as `message/stream` above |
+
+Queue order is strict per-session LIFO — the newest pending message in a
+session is processed first — and every enqueued message eventually gets a
+turn; nothing is coalesced or dropped, only reordered. Worker config
+(`CHAT_QUEUE_*` env vars): see
+[Deploying → Operational notes](deploying.md#operational-notes). Design:
+[async chat endpoint spec](superpowers/specs/2026-08-20-async-chat-endpoint-design.md).
+
+### `POST /v2/comp/session/{session_id}/message/{message_id}/image/edit`
+
+Revise a picture the character already sent. `{message_id}` is an image turn —
+a message whose history entry carries `"image": true`. The engine composes a new
+image prompt from that picture's subject plus the instruction, persists a new
+image-only assistant message, and returns its `image_request` payload; the
+consumer draws it, exactly as for a chat image turn.
+
+```json
+{
+  "instruction": "换套衣服",
+  "style": "realistic",
+  "aspect_ratio": "3:4",
+  "prompt_variant": "a",
+  "persist_instruction": true,
+  "evaluate_affinity": true,
+  "reply_with_text": 0.4
+}
+```
+
+- `instruction` — required, non-blank, ≤4096 chars. What to change, in the
+  user's words. Without `persist_instruction` it is an input to a picture, not
+  a chat message: recorded on the audit row and never persisted as
+  conversation.
+- `style` — `realistic` (default) | `semi_realistic` | `anime`. Pass the style
+  the source was drawn with; the engine does not record it on the message.
+- `aspect_ratio` — `1:1` | `3:4` | `4:3` | `9:16` | `16:9`. Defaults to the
+  source turn's.
+- `prompt_variant` — selects a `[tasks.chat_image_edit_compose].filter_prompt`
+  variant, with the same rules as the chat path's `image.prompt_variant`.
+- `persist_instruction` — default `false`. When set, the instruction is
+  persisted as an ordinary `role='user'` message quoting the source turn
+  (`metadata.reply_to_message_id`, the same key the chat path writes), and the
+  new image row hangs off it instead of inheriting the source's turn. History
+  then replays the exchange: user instruction → assistant picture. The row is
+  a real user message — visible to companion context, memory extraction and
+  later affinity evaluation like anything else the user said.
+- `evaluate_affinity` — default `false`. When set, the turn goes through the
+  standard per-turn affinity judge: the instruction is what the user said, the
+  new picture's caption is what the character answered. Detached — the response
+  never waits on the judge. Orthogonal to `persist_instruction` (the judge
+  reads the instruction either way); when an instruction row was persisted it
+  anchors the affinity event's `user_message_id`. Overridden by
+  `reply_with_text` — the full pipeline it starts already includes the judge.
+- `reply_with_text` — absent by default; `0.0`–`1.0`, else 422. Requires
+  `persist_instruction` (silently inert without it). When present, the edit is
+  a **full chat turn**: the whole post-turn pipeline runs afterward — affinity,
+  memory, insights, exactly as after a chat turn — and the value is the
+  probability that the character also says something with the picture. `0`
+  never (`reply_image` every time), `1` always (`reply_text_image` every
+  time), in between the engine rolls — the dice stand in for the PDE, which
+  this endpoint never consults. The text half is a real companion-model reply
+  driven by the persisted instruction row (history, memory recall and
+  relationship context included) and lands in the same assistant row as the
+  picture, chat-shaped. A failed or blank text half degrades the turn to
+  `reply_image` — the picture is the turn's substance — and the row's failure
+  columns keep the evidence.
+
+```json
+{
+  "message_id": "…",
+  "edit_of": "…",
+  "composed_prompt": "<base64>",
+  "image_ref": "previous",
+  "aspect_ratio": "3:4",
+  "caption": "换了条裙子",
+  "instruction_message_id": "…",
+  "action_type": "reply_text_image",
+  "reply_text": "新造型来啦，你看看喜欢吗"
+}
+```
+
+`instruction_message_id` is present only when `persist_instruction` was set:
+the persisted instruction message, so a client can render the user bubble
+without refetching history.
+
+`action_type` says what the turn is: `reply_text_image` when the
+`reply_with_text` dice rolled a text half and it landed, `reply_image`
+otherwise — including every call without `reply_with_text`. `reply_text` is
+present exactly on `reply_text_image` turns.
+
+`composed_prompt` is base64(STANDARD) of the UTF-8 wire prompt — the same
+encoding as the SSE `image_request` frame and the recovery endpoint, so an
+existing draw path consumes it unchanged. `image_ref` is always `previous`, and
+on an edit turn that means **the `edit_of` picture**, not whatever the consumer
+drew last.
+
+The new message is an ordinary image turn: it appears in history with
+`"image": true` and its prompt is recoverable via
+`GET /comp/chat/{session_id}/messages/{message_id}/image-request`. Its
+`metadata.image` additionally carries `edit_of`. An edit can itself be edited.
+
+Nothing else about a turn runs on this call by default: no PDE decision, no
+affinity movement, no insight or memory extraction. Two opt-ins widen that:
+`evaluate_affinity` runs the affinity pass alone, nothing else; and
+`reply_with_text` turns the whole call into a full chat turn (see above).
+Without `persist_instruction` the
+new row inherits the source's `user_message_id` — the edit belongs to the turn
+the original picture answered; with it, the new row's `user_message_id` is the
+persisted instruction message.
+
+| Status | Meaning |
+|---|---|
+| 401 | missing or invalid bearer |
+| 403 | not your session |
+| 404 | unknown session, or no such message in it |
+| **409** | the message exists but is not an image turn |
+| 422 | blank `instruction`, or unsupported `aspect_ratio` |
+| 501 | neither `[tasks.chat_image_edit_compose]` nor `[tasks.chat_image_prompt_compose]` is configured |
+| 429 | per-user in-flight cap reached (3, shared with chat/voice/compose) |
+| 5XX | composer chain exhausted — the provider's own status and body, as on the compose endpoint. **No message is persisted**; retry is safe |
+
+A body that fails to deserialize (missing `instruction`, wrong type for
+`style`) or a malformed path UUID is rejected by axum's extractors before any
+of the above, with a framework-shaped plain-text 400/422 — not the
+`{"error", "message"}` shape this endpoint returns. The 422 cases in the table
+above (blank `instruction`, unsupported `aspect_ratio`) are ones the request
+deserialized successfully into, gated after ownership and state as described.
+
+Requires `[tasks.chat_image_edit_compose]` **or** `[tasks.chat_image_prompt_compose]`:
+with only the latter, edits run on the chat composer's chain using the engine's
+built-in edit prompt.
+
+### `GET /comp/chat/{session_id}/history?limit=20&offset=0`
+
+Paginated message history, newest first. `limit` defaults to 20 (capped at 50).
+
+```json
+{
+  "session_id": "…",
+  "messages": [
+    { "id": "…", "role": "assistant", "content": "Bishop.", "sent_at": "…", "read_at": "…" },
+    { "id": "…", "role": "user",      "content": "hi…",     "sent_at": "…", "read_at": "…" },
+    { "id": "…", "role": "assistant", "content": "…", "sent_at": "…", "channel": "product_qa" },
+    { "id": "…", "role": "assistant", "content": "",  "sent_at": "…", "image": true }
+  ],
+  "total": 4
+}
+```
+
+`id` is the stable message id (the `engine.chat_messages` row key) — it is
+what the `image-request` route below takes. `role` ∈
+`user | assistant | gift_user | system_error`. `gift_user` is a tip
+turn (sent via `tips_amount_usd` on the stream route, above). Each entry also
+carries an optional `channel` field — `"product_qa"` marks an
+out-of-character product answer (excluded from companion context/memory,
+same as its live-stream `action_type`); the field is omitted for normal
+turns. `read_at` is a read receipt and is **omitted entirely while unread** —
+see the route below.
+
+`image: true` is present only on assistant rows whose turn delegated an image
+to the consumer; every other row omits the key (never `false`). It is the
+discovery half of the `image-request` route: feed the flagged entry's `id` to
+that route instead of probing every assistant message. A `404` from that
+route **on a flagged row** means the composed prompt was never recorded —
+genuinely unrecoverable; surface it as such rather than silently dropping
+the image. The flag also tells a rehydrating client that a turn promised an
+image (the `image_request` SSE frame is the turn's last frame and wire-only —
+a disconnect before it fires would otherwise be undetectable from history).
+
+`reply_to_message_id` echoes the quote a `user` row was sent with (see
+**Optional: quote** above): the id of the row it quoted, always in this same
+session.
+
+`user_message_id` names the `role='user'` row whose turn produced this row. It
+is present on assistant rows and on `system_error` notices, and omitted on the
+user rows themselves. The notices matter most: the queue worker and the
+stale-claim reaper write them after the client has already disconnected, so
+history is the only place a client can find them — and a notice is useless
+without knowing which turn failed. Do not assume the newest user row is the one. Same key-presence contract — omitted on ordinary turns,
+and omitted when the anchor failed to resolve, since there is no bubble to
+point at. That failure is recorded as `metadata.reply_to_error` on the row and
+stays audit-only; a client that needs to know its quote was dropped should read
+the SSE turn it sent, not history.
+
+### `GET /comp/chat/{session_id}/messages/{message_id}/image-request`
+
+The delegated `image_request` payload for one persisted image turn — the
+recovery path for consumers that never received the SSE frame (async turns;
+stream clients that disconnected before the frame fired). Auth and session
+ownership checks are the same as `history`.
+
+```json
+{ "message_id": "01J…", "composed_prompt": "5YaZ5a6e…", "image_ref": "previous", "aspect_ratio": "3:4" }
+```
+
+Fields mirror the SSE frame: `composed_prompt` is base64(`STANDARD`) of the
+UTF-8 wire prompt; `image_ref` may be absent on rows persisted before the
+marker carried it. **Absent `image_ref` means unknown, not `face`** — a
+consumer that defaults it to `face` will redraw a `previous`-ref turn against
+the wrong reference image. `404` when the message is not an image turn — or when the
+turn's compose event was never recorded (the audit write is fail-open); in
+that case the prompt is genuinely unrecoverable and the consumer should
+treat the turn as text-only.
+
+### `POST /comp/chat/{session_id}/read`
+
+Mark every message in the session the user did not author as read. Same auth,
+ownership check and 404-on-archived behaviour as the history route above.
+
+```json
+{
+  "session_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
+  "marked": 7
+}
+```
+
+Write-only: the engine records a timestamp and stops there. It does not count
+unread messages, does not notify, and does not decide what "read" looks like —
+a client reads `read_at` off the history entries and renders whatever it wants.
+
+`marked` counts the rows *this* call stamped, so a repeat call returns `200`
+with `0` and an existing stamp is never pushed forward. Call it on every mount
+without inventing an event.
+
+Two roles are out of reach here, and they are the two the user writes. A `user`
+row carries the engine's own stamp — set the instant the turn handed the message
+to its first model, which is the *delivered* tick and not that model's
+acknowledgement; a `gift_user` tip is never stamped by anyone, because nobody
+reads a tip on the user's behalf.
+
+Voice sessions are accepted, and their `assistant` rows are stamped like any
+other — only the engine's own writer is text-only, so it is voice **`user`**
+rows that stay unstamped.
+
+**Read `read_at: absent` as "no receipt", never as "not yet read."** Tips, voice
+`user` rows, and — on a deployment running without the PDE judge — every `user`
+row stay unstamped permanently.
+
+See [2026-08-19-chat-message-read-at-design.md](superpowers/specs/2026-08-19-chat-message-read-at-design.md).
+
+## Voice
+
+### `POST /comp/voice/{session_id}/turn/stream`
+
+Lean voice-channel turn: one transcribed user utterance in, one streamed
+text reply out. STT and TTS are entirely the caller's job — the engine
+never touches audio (see the
+[voice-call parts design spec](superpowers/specs/2026-07-07-voice-call-parts-design.md)).
+
+Returns `text/event-stream` with a reduced frame set: `delta`* then a
+terminal `done`, or a single `error` — the same frame shapes as the chat
+message stream above, but with **no** `meta` frame and no `action_type`.
+
+The session must be a **voice-channel** session (`409 wrong_channel`
+otherwise) — obtain one via `POST /comp/chat/start` with
+`"channel": "voice"`. Voice is opt-in per deployment: without a
+`[tasks.chat_voice]` block in the model config the endpoint returns
+`501 voice_disabled`.
+
+The prompt is lean but not memoryless: persona + voice directive + a
+first-turn **bootstrap snapshot** (frozen once per session, then re-injected
+verbatim every turn) + one relationship line derived from the session's
+affinity (bond/chemistry tiers) + this turn's **recall block**. History is
+the last 8 messages (4 exchanges) — shorter than the chat path's window,
+since the bootstrap and recall carry the longer-range memory instead. A
+voice **turn** writes no memories (no insight extraction, no vector
+writes), but a finished **call** does: once the session goes idle, the
+dreaming-lite sweeper distills its transcript into profile-layer memories,
+so later calls and text chats can recall it. Operators opt out with
+`DREAMING_VOICE_DISABLED=1` — see
+[memory-layers.md](memory-layers.md#voice-turns).
+
+**Bootstrap snapshot** (first turn only, then frozen into
+`chat_sessions.metadata.voice_bootstrap` and replayed on every later turn —
+the provider is stateless, so there is no "inject once" on the wire): a
+`[关于他]` block of `human_insights` bullets (Neutral tier by default; see
+`memory_scope` below) plus a `[上次通话]` block, the previous voice call's
+last 8 messages rendered as a transcript. The two parts degrade
+independently and silently — a failed assembly leaves the marker unwritten
+so the next turn retries.
+
+**Per-turn recall** (every turn, read-only): a small vector-search pass over
+the same `companion_memories` layers the chat path uses, gated by
+`memory_scope` and budgeted at 300 ms — a timeout or search failure just
+drops the block for that turn, never an error. An utterance under 4
+alphanumeric characters after stripping whitespace/punctuation (嗯 / 好啊 /
+哈哈-style backchannels) skips recall entirely, with no embedding call.
+Deployments can force recall off regardless of the request via
+`[tasks.chat_voice] recall = false` (default `true` — see
+[model-config.md](model-config.md)).
+
+Body fields:
+
+- `content` — the user utterance. Max 4096 chars.
+- `client_msg_id` — 26..36 ASCII-printable chars (any UUID or ULID).
+  Replaying the same `(session_id, client_msg_id)` is a conflict **only when
+  the turn already produced something**: an assistant reply already exists
+  (retrying would double-bill), or the turn was deliberately interrupted (see
+  [`turn/interrupt`](#post-compvoicesession_idturninterrupt) below) — either
+  way returns `409 duplicate`. With neither — an abnormal disconnect, or an
+  upstream failure that exhausted every candidate model — the replay
+  **regenerates**: it reuses the persisted user row and issues a fresh call
+  rather than erroring. On that repair path the request body's `content` is
+  **ignored**; the previously persisted utterance is authoritative (a
+  mismatch is only logged as a warning, never rejected), because the
+  per-turn recall embeds that text as its query and must not drift between
+  attempts. This also means a retry after an `Error { retryable: true }`
+  frame now actually succeeds, instead of being turned away by the very
+  duplicate check the client was told it could pass.
+- `affinity_scope` (optional) — same field name, value space, and default
+  (`"bond"`) as the
+  [chat message stream](#post-compchatsession_idmessagestream): a named
+  value `"full" | "bond_and_chemistry" | "bond" | "chemistry" | "none"`,
+  or an array of axis names such as `["warmth", "trust"]`. Voice injects
+  at half granularity, so the resolved axes flatten to the two halves of
+  the relationship line: any bond axis (warmth / intimacy / tension) ⇒
+  the bond half, any chemistry axis (trust / intrigue / patience) ⇒ the
+  chemistry half. The audit trail: the **user** row records the raw value
+  under `metadata.affinity_scope_raw` (and `metadata.memory_scope_raw`),
+  each only when the request carried the field; the **assistant** row
+  keeps the resolved **`metadata.affinity_scope`** — the same 6-bool
+  object (`warmth` / `trust` / `intrigue` / `intimacy` / `patience` /
+  `tension`), byte-identical in shape to what the
+  [chat message stream](#post-compchatsession_idmessagestream) writes —
+  plus the resolved `metadata.memory_scope`.
+- `memory_scope` (optional) — same field name, enum, and default
+  (`"neutral_and_relationship"`) as the
+  [chat message stream](#post-compchatsession_idmessagestream). On the
+  session's **first successfully-assembling** turn, the resolved insight
+  tier picks the bootstrap snapshot's `[关于他]` tier and is frozen for the
+  rest of the call; every turn it also gates that turn's recall block.
+  Later turns cannot change the snapshot's tier.
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"content":"你今天在干嘛？","client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","affinity_scope":"bond","memory_scope":"neutral_and_relationship"}' \
+  http://localhost:8080/comp/voice/{session_id}/turn/stream
+```
+
+### `POST /comp/voice/{session_id}/turn/interrupt`
+
+Reports a deliberate barge-in: the user started talking while the client was
+still playing the companion's reply.
+
+**This endpoint does not stop generation.** Aborting the client's SSE
+connection to `turn/stream` already does that — the stream generator is
+dropped at its current await point, which drops the upstream connection with
+it. This endpoint's only job is to record **what was actually heard**, which
+the aborted generator can no longer do itself: its persist step sits after
+the streaming loop and never runs on a drop. Plain JSON in, plain JSON out —
+this is not an SSE route.
+
+**No `501 voice_disabled` gate**, unlike `turn/stream`. This endpoint makes
+no LLM call, so gating it on `[tasks.chat_voice]` would make an in-flight
+call's interrupt fail if the deployment's config changed mid-call.
+
+Body:
+
+```json
+{ "client_msg_id": "01JABCDEFGHJKMNPQRSTVWXYZ0", "spoken_text": "你今天过得" }
+```
+
+- `client_msg_id` — the turn being interrupted, same 26..36 ASCII-printable
+  format as `turn/stream`. It **must be the session's latest user turn** —
+  see the guard below.
+- `spoken_text` — what TTS actually played, verbatim. MAY be empty (the user
+  cut in before any audible word); an empty string writes no assistant
+  content at all — only the marker on the user row records that an interrupt
+  happened. Max 4096 chars.
+
+Response `200`:
+
+```json
+{ "message_id": "01JABCDEFGHJKMNPQRSTVWXYZ0" }
+```
+
+`message_id` is the assistant row that now holds the spoken text, or `null`
+when nothing was played and no reply row exists to point at.
+
+**Latest-turn guard.** A `client_msg_id` naming anything other than the
+session's most recent user row is rejected with `409 not_latest_turn`.
+Without this guard, the upsert below would let a client overwrite the
+`content` of **any** past assistant reply — you can only barge in on what is
+currently being spoken. This puts an ordering requirement on the client:
+**send the interrupt before starting the next turn.** A late interrupt is
+rejected and the turn simply degrades to the abnormal-disconnect state
+(recoverable via `turn/stream`'s regeneration, described above) rather than
+rewriting history.
+
+**Upsert semantics (completion race).** The abort and the interrupt POST are
+two separate round trips, so the server may not have processed the SSE
+disconnect yet — `turn/stream`'s own post-stream persist can still land
+concurrently. Both writers target the same assistant row (keyed on the user
+row's id, `ON CONFLICT (user_message_id) WHERE role='assistant' AND
+channel='voice'`), so exactly one row survives regardless of arrival order,
+and its `content` always ends up as the interrupt's report:
+
+| Assistant row | `spoken_text` | Result |
+|---|---|---|
+| absent | non-empty | inserted, `truncated = true` |
+| absent | empty | no assistant row written |
+| already exists (race) | non-empty | `content` overwritten, `truncated = true`; `generation_id` (the join key into `llm_generations`) and `affinity_scope` / `memory_scope` metadata preserved |
+| already exists (race) | empty | `content` left untouched |
+
+Repeated interrupt calls for the same turn are idempotent — the marker and
+the upsert both key off the user row's id, so a retry cannot multiply rows.
+
+**A race outside this table: two `turn/stream` generators for the same
+turn**, e.g. an orphaned generator from a dead connection still alive
+(TCP retransmission) when the client's retry starts its own. No interrupt is
+involved, so none of the four rows above apply — there is no marker to make
+one writer authoritative. That case is last-writer-wins on `content`,
+`truncated`, and the audit columns together (never a mix of one generation's
+text with a different generation's `generation_id`); see
+`insert_voice_assistant_message` in `crates/eros-engine-store/src/chat.rs`.
+
+Status ladder:
+
+| Status | Code | When |
+|---|---|---|
+| 200 | — | interrupt recorded (see body above) |
+| 400 | `invalid_payload` | `client_msg_id` outside 26..36 ASCII-printable chars |
+| 401 | `unauthorized` | missing / malformed / expired / wrong-secret JWT |
+| 403 | `session_forbidden` | session not owned by the JWT user |
+| 404 | `session_not_found` | unknown `session_id` |
+| 404 | `turn_not_found` | `client_msg_id` names no user row in this session |
+| 409 | `wrong_channel` | session is not a voice-channel session |
+| 409 | `not_latest_turn` | the named turn is not the session's latest user row |
+| 422 | `unprocessable` | `spoken_text` longer than 4096 chars |
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","spoken_text":"你今天过得"}' \
+  http://localhost:8080/comp/voice/{session_id}/turn/interrupt
+```
+
+## Persona
+
+### `POST /persona/{instance_id}/image/compose`
+
+Standalone image-prompt composition for a persona instance — a consumer that
+wants a prompt for arbitrary text, not a chat turn. **No chat state is
+touched — no session, no messages, no affinity runs, no memory is written.**
+Every call is audited, though, with one caveat for streaming mode on client
+disconnect (see below). The instance must belong to the JWT user (`403`
+otherwise; `404` when it does not exist). Requires
+`[tasks.chat_image_prompt_compose]` (`501 compose_disabled` without it).
+
+The endpoint doubles as a composer test surface: the response carries `model`
+and `generation_id`, and streaming passes the composer's raw output through
+verbatim — the most common failure when tuning a `filter_prompt` is the model
+not emitting valid JSON, and the operator needs to see what it actually
+returned.
+
+Body fields:
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `content` | `String` | yes | Non-empty after trim, max 4096 chars. Lands in the `[对方最新消息]` composer slot. |
+| `scene` | `String` | no | Lands in `[最近场景]`; omitted or blank ⇒ `（无）`. Max 8192 chars (`422` over). A composer *input*, not the prompt — the engine never copies it into `composed_prompt`; only the composer's own output is assembled. |
+| `style` | `String` | no | Same three presets as the chat path; default `realistic`. |
+| `aspect_ratio` | `String` | no | Same allow-list as the chat path; `422` on anything else. |
+| `prompt_variant` | `String` | no | Same variant selection as the chat path, including the unknown-key-falls-back-to-built-in rule. |
+| `stream` | `bool` | no | Default `true`. |
+
+The composer payload is identical to the chat path's five slots, so one
+`filter_prompt` contract serves both callers (see
+[model-config.md](model-config.md)).
+
+Every call — success or failure — is recorded in `engine.chat_images_events`
+(`source = "compose_endpoint"` or `"compose_endpoint_stream"`): the non-stream
+mode writes synchronously before its HTTP response returns, with no gap. The
+streaming mode's writes live inside the SSE generator itself, so a client
+that disconnects before the generator reaches one loses that row too, even
+though the call was billed. See [LLM audit → Image-path event
+tables](llm-audit.md#image-path-event-tables).
+
+Both modes return the same five fields:
+
+| Field | Meaning |
+|---|---|
+| `composed_prompt` | Style preset + persona appearance + subject — the string to hand an image vendor |
+| `subject` | The composer's own prompt field, before assembly |
+| `caption` | The composer's short caption, `null` when it produced none |
+| `model` | The model that actually answered |
+| `generation_id` | For reconciling against provider logs |
+
+`stream: false` returns them as one JSON body. `stream: true` returns
+`text/event-stream`:
+
+```
+data: {"type":"delta","content":"{\"prompt\":\"…"}
+data: {"type":"done","composed_prompt":"…","subject":"…","caption":"…","model":"…","generation_id":"…"}
+```
+
+- `delta` frames carry the composer's raw output as it arrives, verbatim and
+  unparsed.
+- one terminal `done` frame carries the five fields — its payload minus the
+  `type` discriminator is byte-identical to the `stream: false` body.
+- a single `{"type":"error",…}` frame on failure after streaming has begun,
+  matching the chat stream's in-band error shape (`code`, `retryable`,
+  `message`, `user_message`).
+
+There is no `meta` frame. A consumer that only wants the result ignores the
+deltas and reads the terminal frame.
+
+A successful-but-non-JSON composer reply keeps the chat path's behaviour:
+`subject` is the whole raw reply, `caption` is `null`, and `composed_prompt`
+is assembled from it as usual.
+
+**Treat the output as model-generated, not sanitized.** "The engine never
+copies `content` / `scene` into `composed_prompt`" is a routing property, not
+a safety boundary: the composer is a language model reading caller-supplied
+text, so those slots can steer it, and it can echo them back through the
+`delta` frames and `subject`. The length caps bound cost, not influence. A
+caller that forwards `composed_prompt` to an image vendor owns whatever policy
+that vendor requires.
+
+Failure modes:
+
+| Condition | Response |
+|---|---|
+| `[tasks.chat_image_prompt_compose]` absent | `501 compose_disabled` |
+| Instance not owned by the JWT user | `403` |
+| Instance not found | `404` |
+| Blank `content`, over-cap `scene`, bad `aspect_ratio` | `422` |
+| Over the per-user in-flight cap (shared with chat/voice, ≤3) | `429` |
+| Composer chain exhausted | **The provider's own status, verbatim** (see below) — or an in-band `error` frame if streaming has begun. **No portrait fallback here**: the fallback exists to keep a chat turn moving, and this endpoint has no turn to protect. |
+
+**Status passthrough (v1.4.0).** This endpoint used to render `502` whatever the
+upstream said. It now returns the provider's own status — `529`, `503`, `429`,
+or anything else it sent, including a code the engine has never seen. A failure
+with no status of its own (the gateway cases) is synthesised: **`504` for the
+three timeout kinds, `502` for everything else.** Detect a provider failure by
+the body's `"error": "upstream"` key, not by the status.
+
+Passthrough has one bound, and it is a range rather than an allow-list: a status
+**below `400` is never forwarded**. A provider that answers `200` with an error
+envelope in the body has spoken, but not in the status line, and forwarding that
+`200` would tell you the call succeeded. Those answer `502`. The real value is
+still on `upstream_status`, which is why you branch on the body.
+
+```jsonc
+// the provider answered, with a status
+{"error":"upstream","message":"upstream failure: code=529: Overloaded",
+ "upstream_status":529,"provider_code":"529","error_type":"overloaded","retryable":true}
+
+// our path to the provider broke; no upstream status exists
+{"error":"upstream","message":"upstream failure: compose stream open timeout after 15s",
+ "gateway_kind":"open_timeout","retryable":true}
+```
+
+`error` and `message` are unchanged. `upstream_status` / `provider_code` /
+`error_type` appear on the upstream arm (the latter two only when the provider's
+body carried them); `gateway_kind` appears on the gateway arm — one of
+`open_timeout` | `total_timeout` | `idle_timeout` | `transport` | `decode` |
+`config` | `chain_exhausted`. `retryable` is always present and derived from the
+status by HTTP convention (every `5xx`, plus `408` and `429`). **`Retry-After` is
+forwarded verbatim** as a response header when the provider sent one — the engine
+records and passes it on, never acts on it.
+
+The streaming mode's in-band `error` frame keeps its four fields and does **not**
+gain `upstream_status` / `provider_code`: the composer chain is walked while
+opening the stream, so a total failure happens before the SSE response exists and
+comes back as the HTTP error above.
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"content":"在海边，黄昏","style":"realistic","aspect_ratio":"3:4","stream":false}' \
+  http://localhost:8080/persona/{instance_id}/image/compose
+```
+
+## Profile
+
+### `GET /comp/chat/{user_id}/sessions`
+
+All chat sessions for `user_id`. The path's `user_id` MUST match the JWT's user_id; otherwise 403. Returns `{ "sessions": [...] }`, each entry carrying `session_id`, `instance_id`, `is_converted`, `last_active_at`, and `channel`.
+
+### `GET /comp/user/{user_id}/profile`
+
+The flat, typed `human_insights` row for this user — the same columns the insight extractor UPSERTs incrementally after each turn. Same `user_id` equality check as above.
+
+```json
+{
+  "user_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
+  "city": "Hong Kong",
+  "location": null,
+  "hometown": null,
+  "nationality": null,
+  "occupation": "graphic designer",
+  "mbti_guess": "INFP",
+  "love_values": null,
+  "emotional_needs": null,
+  "life_rhythm": null,
+  "interests": ["jazz", "long walks"],
+  "personality_traits": [],
+  "preferred_gender": null,
+  "age_min": null,
+  "age_max": null,
+  "deal_breakers": [],
+  "education": null,
+  "family": null,
+  "relationship_history": null,
+  "social_pattern": null,
+  "future_plans": null,
+  "finance_status": null,
+  "updated_at": "2026-08-11T12:00:00Z"
+}
+```
+
+`updated_at: null` means the user has no `human_insights` row yet — no extraction has landed — and every other field is `null`/`[]` in that response. There is no aggregate "training level" score anymore; `agent_training_level` and the raw `companion_insights` JSONB were removed with the companion_insights teardown (spec 2026-08-11) — the typed columns above are the whole surface now.
+
+### `GET /comp/instance/{instance_id}/profile`
+
+The flat, typed `character_insights` row for one relationship (`persona_instances.id`) — the AI character's own conversation-derived profile, the mirror of the human profile above. The instance's `owner_uid` MUST match the JWT's user_id; otherwise 403. An unknown or archived (`status <> 'active'`) instance is 404. Experimental (v1.3.0) — see [2026-08-15-character-insights-design.md](superpowers/specs/2026-08-15-character-insights-design.md).
+
+```json
+{
+  "instance_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
+  "location": "the office, working late",
+  "occupation": null,
+  "current_situation": null,
+  "desires": null,
+  "vulnerabilities": null,
+  "habits": null,
+  "personal_values": null,
+  "likes": [],
+  "dislikes": [],
+  "relationships": [],
+  "updated_at": "2026-08-15T12:00:00Z"
+}
+```
+
+`updated_at: null` means this instance has no `character_insights` row yet — the character extraction chain has not produced a result — and every other field is `null`/`[]` in that response, same convention as the human profile above. Four of these fields — `current_situation`, `occupation`, `location`, `relationships` — are read back into the chat prompt as the `[character_state]` block, and the fill level of all ten sizes the injected history window (see [Deploying → Operational notes](deploying.md#operational-notes)); the other six are database-only.
+
+This route is v1 and frozen — it keeps working and is not going away. The v2
+equivalent, with the same fields under the v2 path convention, is
+`GET /v2/comp/instance/{instance_id}/insight/character` (below).
+
+### `GET /v2/comp/instance/{instance_id}/insight/character`
+
+`CharacterInsightResponse` — the `character_insights` row, under the v2 API
+convention (the entity segment before the id names what the id belongs to;
+`insight` replaces v1's overloaded `profile`). Same fields as v1's
+[`GET /comp/instance/{instance_id}/profile`](#get-compinstanceinstance_idprofile)
+above. `GET`, authenticated, keyed on the relationship rather than the user:
+the instance's `owner_uid` must equal the JWT's user_id, else `403`; an
+unknown or archived (`status <> 'active'`) instance is `404`; no row yet is
+`200` with every field `null`/`[]` and `updated_at: null` — same convention
+as the v1 routes.
+
+```json
+{
+  "instance_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
+  "location": null,
+  "occupation": null,
+  "current_situation": null,
+  "desires": null,
+  "vulnerabilities": null,
+  "habits": null,
+  "personal_values": null,
+  "likes": [],
+  "dislikes": [],
+  "relationships": [],
+  "updated_at": null
+}
+```
+
+### `GET /v2/comp/instance/{instance_id}/insight/user`
+
+`UserInsightResponse` — the `user_insights` row, the real user's profile
+*inside this one relationship*. Same ten fields, same shape, same ownership/
+404/no-row rules as `.../insight/character` above. **This is not
+`human_insights`**, the global profile served at
+[`GET /comp/user/{user_id}/profile`](#get-compuseruser_idprofile) above:
+`user_insights` is per-relationship, database-only, and record-only —
+nothing reads it back into any chat, voice, or PDE prompt. Experimental
+(v1.6.0) — see
+[2026-08-22-user-insights-and-api-v2-design.md](superpowers/specs/2026-08-22-user-insights-and-api-v2-design.md).
+
+### `DELETE /comp/instance/{instance_id}/sessions`
+
+Soft-delete every session this user holds with one persona instance. The instance's `owner_uid` MUST match the JWT's user_id; otherwise 403. An unknown instance is 404 — unlike the profile route above, a dormant (`status <> 'active'`) instance is accepted, because a client may clear the conversations of a relationship it has already marked over.
+
+```json
+{
+  "instance_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
+  "archived_sessions": 2
+}
+```
+
+`archived_sessions` counts the sessions flipped by *this* call, so a repeat call returns `200` with `0`. Every channel is archived, voice included — the unit is the relationship, not one client's view of it.
+
+**What is deleted:** `companion_affinity` (and its events, by cascade), the relationship layer of `companion_memories`, and `character_insights` — the state that would otherwise carry into the next conversation. **What is not:** `chat_messages`. The transcript stays, so the audit tables that reference a session by id (`companion_decision_events`, `character_insights_events`, `chat_vision_events`, `chat_images_events`) still point at something readable. The profile layer of `companion_memories` (`instance_id IS NULL`) also stays — those are cross-persona facts about the user.
+
+Afterwards the sessions are invisible everywhere: history, affinity, the session list, the chat and voice turn routes all return 404 or omit them, and `POST /comp/chat/start` creates a new session rather than resuming an archived one.
+
+There is no restore endpoint by design. Reviving one session is an operator action:
+
+```sql
+UPDATE engine.chat_sessions SET archived = false WHERE id = '<session-uuid>';
+```
+
+The transcript comes back; the relationship state does not. See [2026-08-18-session-soft-delete-design.md](superpowers/specs/2026-08-18-session-soft-delete-design.md).
+
+> **Tips replaced gift events.** The standalone gift routes
+> (`POST /comp/chat/{session_id}/event/gift`, `GET /comp/chat/{session_id}/gifts`)
+> were removed. A tip is now part of a normal stream turn — set
+> `tips_amount_usd` on `POST /comp/chat/{session_id}/message/stream` (see above).
+
+## World Town
+
+The user's world publishes a town feed: posts written by their persona
+instances, each with a comment thread. Both routes carry the same JWT contract
+as `/comp/*` — the path `user_id` must equal the JWT `sub`, otherwise `403`.
+Rendering is entirely downstream's job; these endpoints only move data. What
+decides that a post gets written at all — enrolment, tick intervals, cooldowns,
+the daily cap — is in [World system](world-system.md).
+
+### `GET /world/town/{user_id}/feed?limit=20&cursor=`
+
+Published posts, newest first, each with its full comment thread inlined.
+`limit` defaults to 20 and is clamped to 50. A user who is not enrolled, or
+whose town is switched off, gets an **empty feed, not an error**.
+
+```json
+{
+  "user_id": "…",
+  "posts": [
+    {
+      "post_id": "…",
+      "instance_id": "…",
+      "author_name": "Ada",
+      "content": "…",
+      "published_at": "…",
+      "comments": [
+        {
+          "comment_id": "…",
+          "author_instance_id": "…",
+          "author_name": "Bishop",
+          "content": "…",
+          "created_at": "…"
+        }
+      ]
+    }
+  ],
+  "next_cursor": "2026-08-17T04:12:00+00:00|<post uuid>"
+}
+```
+
+- `next_cursor` — present only when another page may exist; feed it back
+  verbatim as `cursor`. Treat it as opaque. A cursor that does not parse is a
+  `400 bad_request`, not an empty page.
+- `comments[].author_instance_id` — `null` when the comment is the user's own;
+  otherwise the persona instance that wrote it.
+
+### `POST /world/town/{user_id}/posts/{post_id}/comments`
+
+Adds a user comment to a post in that user's own town.
+
+```json
+{ "content": "…" }
+```
+
+`content` is trimmed, then must be non-empty and at most 1000 characters —
+`400` otherwise. Returns the created comment in the same shape as a
+`comments[]` entry above. A post that is not visible to this user is `404`,
+including one that exists in someone else's town.
+
+## BFF (`/bff/v1/*`)
+
+A frontend-shaped mirror of selected `/comp/*` routes for first-party
+clients. Same Supabase JWT auth and the same per-user ownership checks as
+the canonical routes — only the **response shape** differs (slimmer DTOs,
+bundled payloads). Canonical `/comp/*` routes are never reshaped to fit a
+frontend; a BFF route is added alongside instead. Five routes exist today.
+
+### `POST /bff/v1/comp/chat/start`
+
+Cold-mount bundle: resolves (or creates) the session **and** returns its
+recent history in one round-trip, collapsing the frontend's separate
+`start` + `history` calls. For the same user + input it resolves to the
+exact same session as the canonical `POST /comp/chat/start`.
+
+The body is the canonical start body plus one BFF-only field:
+
+- `genome_id` / `instance_id` — identify the persona (same as canonical).
+- `is_demo` — optional, same as canonical.
+- `history_limit` — optional bundled-history page size; default 50, capped at 50.
+- `force_new` — optional, same as canonical. Passed through to
+  `StartChatRequest::force_new` — skip resume and always create a fresh
+  session (`is_new: true`); recommended for voice calls (see the
+  [voice section](#post-compvoicesession_idturnstream) above).
+
+```json
+{
+  "session_id": "5f7e…",
+  "instance_id": "…",
+  "persona_name": "Aria",
+  "is_new": false,
+  "history": [
+    { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "hello",   "sent_at": "…" },
+    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "hi back", "sent_at": "…" }
+  ]
+}
+```
+
+Affinity is intentionally **not** bundled here — the frontend reads it
+separately via the two affinity routes below, so a cold mount that does not
+need a relationship pays nothing for one.
+
+### `GET /bff/v1/comp/chat/{session_id}/history?limit=50&offset=0`
+
+Slim history projection for the chat screen: `id` / `client_msg_id` /
+`role` / `content` / `sent_at` (no `extracted_facts`), plus `tips_amount_usd`
+on tip rows (present only when `role = gift_user`; omitted otherwise), and an
+optional `channel` field — `"product_qa"` marks an out-of-character product
+answer (excluded from companion context/memory); omitted for normal turns —
+and `read_at`, the read receipt described under `POST /comp/chat/{session_id}/read`
+(omitted while unread). `id` is the
+`chat_messages` row primary key (UUID); `client_msg_id` is the id the FE
+sent during streaming (`null` for rows that never carried one, e.g.
+assistant turns). `image: true` marks an assistant row whose turn delegated
+an image (omitted on every other row, never `false`) — the same key-presence
+contract and `image-request` discovery semantics as the canonical history
+route above, including the "404 on a flagged row = unrecoverable" reading.
+The `POST /bff/v1/comp/chat/start` bundle serializes history through this
+same entry shape and therefore carries the flag too. `user_message_id` names the
+`role='user'` row whose turn produced this row — present on assistant rows and
+on `system_error` notices, omitted on user rows. `reply_to_message_id`
+echoes the quote a `user` row was sent with (see the stream route's
+**Optional: quote** section) — the id of the row it quoted, always in this same
+session; omitted on ordinary turns and on turns whose anchor failed to resolve,
+so a cold mount can re-render the quote without keeping local state. Same auth, ownership check, and
+`limit ∈ [1, 50]` clamp as the canonical history route. **Intentional
+divergence:** the default `limit` is 50 (the canonical route defaults to 20),
+because the BFF exists for a cold mount that wants a full backscroll in one
+round-trip.
+
+```json
+{
+  "session_id": "…",
+  "messages": [
+    { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "alpha", "sent_at": "…", "read_at": "…" },
+    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "beta",  "sent_at": "…", "read_at": "…" },
+    { "id": "a1b2c3d4-…", "client_msg_id": null,    "role": "assistant", "content": "gamma", "sent_at": "…", "channel": "product_qa" },
+    { "id": "b5c6d7e8-…", "client_msg_id": null,    "role": "assistant", "content": "",      "sent_at": "…", "image": true },
+    { "id": "c9d0e1f2-…", "client_msg_id": "c_def", "role": "user",      "content": "wait, about that", "sent_at": "…", "reply_to_message_id": "3cc06c53-…" }
+  ],
+  "total": 5
+}
+```
+
+`total` is the count of `messages` in **this** response (`== messages.len()`),
+not the grand total of rows in the session.
+
+### `GET /bff/v1/comp/affinity/{session_id}/event`
+
+Latest user-turn affinity delta (the applied per-axis change) **plus the
+post-turn absolute state**, for per-turn frontend observation. JWT + ownership
+checked.
+
+Query parameters (both optional):
+
+- `after` — long-poll baseline: the `event_id` the caller already has. While
+  the session's latest turn event still matches it (or none exists yet), the
+  request is held open until a newer event lands or `wait` elapses — a
+  timed-out response returns the unchanged state, same shape as the immediate
+  path. Absent ⇒ the latest event is returned immediately.
+- `wait` — how long to hold the request open, in milliseconds. Only
+  meaningful with `after`. Default 10000, server-capped at 25000.
+
+```json
+{
+  "session_id": "…",
+  "event": {
+    "event_id": "…",
+    "event_type": "message",
+    "effective_deltas": {
+      "warmth": 0.03, "trust": 0.01, "intrigue": 0.0,
+      "intimacy": 0.0, "patience": 0.0, "tension": -0.01
+    },
+    "effective_deltas_computed": {
+      "bond": 0.013,
+      "chemistry": 0.006
+    },
+    "label_changes": {
+      "bond": { "from": "friend", "to": "close_friend" }
+    },
+    "state_after": {
+      "warmth": 0.31, "trust": 0.44, "intrigue": 0.40,
+      "intimacy": 0.19, "patience": 0.27, "tension": 0.17,
+      "bond": 0.42, "chemistry": 0.18,
+      "bond_tier": 3, "chem_tier": 2,
+      "warmth_grade": 2, "patience_grade": 2,
+      "ghost_streak": 0, "total_ghosts": 2,
+      "updated_at": "2026-08-17T14:02:11.412Z"
+    },
+    "user_message_id": "…",
+    "created_at": "…"
+  }
+}
+```
+
+`event` is `null` when there is no user-turn event yet (brand-new session,
+or only time-decay), or when the latest event predates affinity migration
+`0014`. `event_type` ∈ `message | gift | proactive | ghost`; a ghost turn
+reports all-zero `effective_deltas`.
+
+- `effective_deltas_computed` — exact floored per-turn line delta computed at
+  persist time from the floored before/after bond/chemistry scores; read from
+  the stored event column. Composite-score units — the same 0..1 scale as the
+  snapshot's `bond`/`chemistry`. Good for a "+X bond / +Y chemistry" per-turn
+  pulse. May be absent on pre-migration rows.
+- `label_changes` — engine-authoritative tier transition (`null` / absent when
+  no tier crossed this turn). Frontend stops computing this itself.
+- `state_after` — the post-turn absolute state, read from the stored event
+  column (absent on rows written before migration `0049`). This replaces
+  client-side accumulation: adopt it as the new absolute value each turn
+  instead of adding deltas to a running total. It is a **write-time**
+  snapshot — after an absence only `GET /bff/v1/comp/affinity/{session_id}`
+  is correct, because that route refreshes the derived endpoints at read.
+- `user_message_id` — the user message (`chat_messages.id`) that drove this
+  turn; attach the delta to that message or to its replies
+  (`chat_messages.user_message_id`). Absent on `proactive` / `time_decay`
+  events and on rows written before migration `0056`.
+
+### `GET /bff/v1/comp/affinity/{session_id}`
+
+Absolute affinity for the session, **refreshed at read time** — the supported
+way for a client to render a relationship. JWT + ownership checked, same
+status codes as the event route above (404 unknown session, 403 someone
+else's).
+
+```json
+{
+  "session_id": "…",
+  "affinity": {
+    "warmth": 0.3106, "trust": 0.4402, "intrigue": 0.4024,
+    "intimacy": 0.1901, "patience": 0.2740, "tension": 0.1703,
+    "bond": 0.4213, "chemistry": 0.1802,
+    "bond_tier": 3, "chem_tier": 2,
+    "bond_label": "close_friend", "chemistry_label": "flirtation",
+    "ghost_streak": 0, "total_ghosts": 2,
+    "updated_at": "2026-08-17T14:02:11Z"
+  }
+}
+```
+
+`affinity` is `null` when the session has no affinity row yet — the row is
+created on the first turn, so a just-started session legitimately has none.
+
+- `bond` / `chemistry` — the real stored composite scores (0–1); no display
+  curve (the pacing nonlinearity lives in the write-side tier decay — see
+  [affinity-model.md](affinity-model.md)).
+- `bond_tier` / `chem_tier` — 1..=5. Returned alongside the keys so a client
+  needs neither the thresholds nor an ordered tier array. **Do not re-derive
+  the tier from the score**; the thresholds are engine-owned and a local copy
+  will drift.
+- `bond_label` ∈ `acquaintance | friend | close_friend | confidant | soulmate`
+- `chemistry_label` ∈ `spark | flirtation | crush | lover | beloved`
+
+`apply_time_decay()` + `refresh_endpoints()` run before the response is
+serialised, and that is the reason to call this rather than read
+`engine.companion_affinity` directly: `warmth` and `patience` are derived from
+the judge level, the counterpart line and the elapsed gap, with the stored
+columns holding only a write-time cache. A direct `SELECT` returns a
+relationship that reads warmer the longer the user has been away.
+
+### `GET /bff/v1/comp/affinities/{user_id}`
+
+Every companion's current affinity for one user, in one round trip — the list
+form of the route above, for a client rendering one row per companion. The
+`{user_id}` path parameter MUST match the JWT's user_id; mismatch returns 403.
+
+| Query param | Default | Notes |
+|-------------|---------|-------|
+| `limit` | 50 | Clamped to 1..=200, never rejected. |
+| `cursor` | — | Opaque, taken verbatim from the previous page's `next_cursor`. Malformed ⇒ 400. |
+
+```json
+{
+  "user_id": "…",
+  "items": [
+    {
+      "session_id": "…",
+      "genome_id": "…",
+      "affinity": { "…": "identical to the single-session shape above" }
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+- **Every row gets the same read-time refresh** as the single-session route. A
+  row that skipped it would be no better than the stored columns.
+- `genome_id` is the companion the relationship is with — a list keyed by
+  companion joins on it without a second round trip.
+- Ordered `updated_at DESC, session_id DESC`, so page one holds the rows a list
+  actually shows first. The cursor is a keyset on that pair; `session_id`
+  breaks timestamp ties, which is what keeps a page boundary landing on a tie
+  from skipping a row or serving it twice.
+- `next_cursor` is `null` on the last page — walk until it is.
+- **A session with no affinity row is absent**, not present with
+  `affinity: null`. The list is driven by the relationships themselves, so
+  "missing from the response" means "no relationship yet" — the state the
+  single-session route reports as `affinity: null`.
+- No per-session 403/404: the response only ever contains rows the caller owns,
+  so a foreign or unknown session is simply absent.
+
+## Error responses
+
+Most errors are JSON with `{"error": "<code>", "message": "<human-readable>"}`.
+The streaming routes (`POST /comp/chat/{session_id}/message/stream`, `POST
+/comp/voice/{session_id}/turn/stream`, and `POST
+/persona/{instance_id}/image/compose`) are the exception: most of the
+failure modes on all three routes use the `code` / `message` /
+`user_message` shape described under "Pre-stream errors" above, with no
+`"error"` key. `POST /comp/voice/{session_id}/turn/interrupt` shares that
+same error body shape even though it is not itself a stream (its success
+response is plain JSON) — it reuses the voice turn's precondition checks and
+error type. The table below covers the plain shape:
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `bad_request` | Malformed body, invalid UUID, missing required field |
+| 401 | `unauthorized` | Missing / malformed / expired / wrong-secret JWT |
+| 403 | `forbidden` | Path-user vs JWT-user mismatch, or trying to read a session you don't own |
+| 404 | `not_found` | Unknown session / persona / message id |
+| 500 | `internal` | Anything else (DB error, LLM API error, etc.) |
+| *the provider's own status* | `upstream` | The upstream provider failed the call (currently only the persona compose endpoint — its composer chain was exhausted). Since v1.4.0 this is **not always 502**: the provider's status passes through verbatim (`529`, `503`, `429`, …), and a gateway-layer failure with no upstream status maps to `504` for a timeout and `502` otherwise. The body carries `upstream_status` / `provider_code` / `error_type` or `gateway_kind`, plus `retryable` — see [the compose endpoint](#post-personainstance_idimagecompose). Branch on the `"error": "upstream"` key, not on the status. |
+
+## Source
+
+- `crates/eros-engine-server/src/routes/companion.rs` — chat-lifecycle / profile handlers
+- `crates/eros-engine-server/src/routes/companion_stream.rs` — streaming chat turn (`message/stream`), incl. tip + `image_url` handling
+- `crates/eros-engine-server/src/routes/companion_async.rs` — enqueue-only chat turn (`v2/comp/session/{session_id}/message/async`)
+- `crates/eros-engine-server/src/routes/insight.rs` — v2 relationship-scoped insight profiles (`v2/comp/instance/{instance_id}/insight/character`, `.../insight/user`)
+- `crates/eros-engine-server/src/pipeline/chat_queue.rs` — async chat-turn queue worker
+- `crates/eros-engine-server/src/routes/voice.rs` — voice-channel turn (`voice/{session_id}/turn/stream`)
+- `crates/eros-engine-server/src/routes/persona.rs` — standalone image-prompt composition (`/persona/{instance_id}/image/compose`)
+- `crates/eros-engine-server/src/routes/world_town.rs` — World Town feed and comments (`/world/town/*`)
+- `crates/eros-engine-server/src/routes/bff/companion.rs` — BFF `/bff/v1/comp/chat/*`
+- `crates/eros-engine-server/src/routes/bff/affinity.rs` — BFF `/bff/v1/comp/affinity/*`
+- `crates/eros-engine-server/src/routes/health.rs` — `/healthz`
+- `crates/eros-engine-server/src/openapi.rs` — Scalar UI spec metadata

@@ -1,0 +1,21 @@
+/*
+ * Chat-shell local styles.
+ *
+ * The app's global theme is the legacy sci-fi stylesheet; the chat shell keeps
+ * its own keyframes here so nothing in that file has to be disturbed.
+ */
+
+@-webkit-keyframes eros-caret {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@keyframes eros-caret {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* Long RP text reads better with a narrower measure and lighter tracking. */
+[data-row='assistant'] {
+  scroll-margin-top: 12px;
+}

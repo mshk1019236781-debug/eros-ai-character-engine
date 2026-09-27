@@ -1,0 +1,1600 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! World Memories director sweeper (spec §2).
+//!
+//! Per tick: backfill state rows for new enrollments, claim due owners
+//! (SKIP LOCKED, dreaming-style), and run one structured LLM round per
+//! claimed owner: previous seed + active roster + extracted memory feedback
+//! → new seed + per-persona digests + script fragments. Persistence is a
+//! single transaction; ANY failure releases the claim and the owner retries
+//! at its next due scan. No retry queue, no partial writes.
+
+use serde::Deserialize;
+use uuid::Uuid;
+
+use eros_engine_llm::model_config::ResolvedWorldDirector;
+use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+use eros_engine_store::story::StoryRepo;
+use eros_engine_store::world::{FragmentInsert, PostInsert, RosterEntry, WorldRepo};
+
+use crate::state::AppState;
+
+const WORLD_TASK: &str = "world_director";
+/// Sentinel OpenRouter `user` for world-subsystem background calls. Distinct
+/// from dreaming's `...111` so OpenRouter spend is attributable per subsystem
+/// (spec §2.6). Not a real auth UUID; cannot collide with a real user.
+pub(crate) const WORLD_AUDIT_USER: &str = "11111111-1111-1111-1111-111111111112";
+/// Max owners claimed per tick.
+const WORLD_PICK_BATCH: i64 = 5;
+/// Claim considered crashed after this (spec §2.2).
+const WORLD_CLAIM_STALE: std::time::Duration = std::time::Duration::from_secs(1800);
+/// Roster cap per world (spec §2.3): earliest-created wins, warn on truncation.
+/// `pub(crate)`: also the story sweeper's `ensure_insight_rows` backfill cap
+/// (spec §3: same roster, same cap, same order as the WM roster).
+pub(crate) const WORLD_ROSTER_CAP: usize = 8;
+/// Memory-feedback rows per round (spec §2.3).
+const WORLD_FEEDBACK_K: i64 = 15;
+/// Defensive cap on fragments accepted per persona per round.
+const WORLD_FRAGMENTS_PER_PERSONA_CAP: usize = 6;
+/// Recent story events fed into the WM director per persona (spec §4).
+const WM_STORY_EVENTS_PER_PERSONA: usize = 10;
+
+/// Fixed engine-owned rules appended to every director payload. The
+/// operator-owned filter_prompt carries tone/genre; these are the floor.
+const WORLD_DIRECTOR_RULES: &str = "规则：\
+1) 用户是场外人：可以被角色们自然提及，但绝不能编造用户做过的事或说过的话。\
+2) seed 描述角色之间的关系图与剧情弧线，供下一轮延续。\
+3) 每个角色输出 digest（该角色视角的世界近况摘要，1-2 句）和 script_fragments\
+（当期发生的具体事件片段，每条一句、自成一体、适合单独召回）。\
+4) 只使用给出的 instance_id。\
+5) 一切设定（时代、科技、地点、职业、事件）必须符合 worldview 描述的世界观，\
+不得引入与其冲突的元素。";
+
+/// Appended to WORLD_DIRECTOR_RULES only for town-enabled owners.
+const WORLD_TOWN_POST_RULES: &str = "\
+6) posts：为部分角色生成朋友圈式贴文（不是每个角色都要发；没有合适内容就输出空数组）。\
+每条含 instance_id、content（贴文正文，第一人称）、publish_at（ISO-8601 时间戳，\
+安排在未来一个周期内的自然时刻）。";
+
+/// Appended to WORLD_DIRECTOR_RULES only when the owner is stories-active
+/// (spec §4): scripts must stay consistent with each persona's recent_life;
+/// persona↔user relationship states come from recent_life; the WM-layer
+/// user-grounding rule is restated so the stories doorway can't erode it.
+///
+/// Numbered 7) — the town rule 6) (`WORLD_TOWN_POST_RULES`) is only
+/// conditionally appended, so a stories-active town-disabled owner sees
+/// rules 1,2,3,4,5,7 (no 6). Harmless: the numbers are cosmetic labels for
+/// the model, not referenced elsewhere. Do not dynamically renumber —
+/// that would alter the payload string for no behavioral gain.
+const WORLD_STORIES_WM_RULES: &str = "\
+7) 各角色的个人生活以其 recent_life 为准，剧本必须与之一致，不可矛盾；\
+角色与用户的关系状态以 recent_life 为准，其他角色可以自然提及，\
+但仍绝不编造用户的言行。";
+
+/// SHA-256 lowercase hex of the (already trimmed) worldview content —
+/// stored in world_states.worldview_hash; mismatch ⇒ reset round (spec §3).
+fn worldview_sha256_hex(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(content.as_bytes()))
+}
+
+#[derive(Debug, Deserialize)]
+struct DirectorOutput {
+    seed: serde_json::Value,
+    personas: Vec<DirectorPersona>,
+    #[serde(default)]
+    posts: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DirectorPersona {
+    instance_id: Uuid,
+    digest: String,
+    #[serde(default)]
+    script_fragments: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DirectorPost {
+    instance_id: Uuid,
+    content: String,
+    publish_at: String,
+}
+
+/// Run forever; spawn once at boot. Inert when WORLD_DISABLED is set or
+/// `[tasks.world_director]` is absent/blank.
+pub async fn sweeper(state: AppState) {
+    if state.config.world.disabled {
+        tracing::info!("world sweeper disabled (WORLD_DISABLED)");
+        return;
+    }
+    let Some(resolved) = state.model_config.resolve_world_director() else {
+        tracing::info!("world_director not configured — world sweeper inert");
+        return;
+    };
+    let tick_interval = state.config.world.tick;
+    if tick_interval.is_zero() {
+        tracing::info!("world sweeper disabled (WORLD_TICK_SECS=0)");
+        return;
+    }
+    tracing::info!(
+        ?tick_interval,
+        interval_hours = resolved.interval_hours,
+        retention_days = resolved.retention_days,
+        "world sweeper starting"
+    );
+    let stories = if state.config.world.stories_disabled {
+        tracing::info!("world stories disabled (WORLD_STORIES_DISABLED)");
+        None
+    } else {
+        let r = state.model_config.resolve_world_stories_director();
+        if r.is_none() {
+            tracing::info!("world_stories_director not configured — stories inert");
+        }
+        r
+    };
+    let mut tick = tokio::time::interval(tick_interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        match run_round(&state, &resolved).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(processed = n, "world: director rounds completed"),
+            Err(e) => tracing::warn!("world: round scan failed: {e}"),
+        }
+        if let Some(s) = &stories {
+            match super::story::run_stories_scan(&state, s).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(processed = n, "world: story rounds completed"),
+                Err(e) => tracing::warn!("world: story scan failed: {e}"),
+            }
+        }
+    }
+}
+
+/// One tick: backfill + claim + per-owner rounds. Per-owner failures release
+/// that owner's claim and continue with the rest.
+async fn run_round(
+    state: &AppState,
+    resolved: &ResolvedWorldDirector,
+) -> Result<usize, sqlx::Error> {
+    let repo = WorldRepo { pool: &state.pool };
+    repo.ensure_states_for_enrollments().await?;
+    let interval = std::time::Duration::from_secs(u64::from(resolved.interval_hours) * 3600);
+    let owners = repo
+        .claim_due(interval, WORLD_CLAIM_STALE, WORLD_PICK_BATCH)
+        .await?;
+    let mut count = 0;
+    for (owner, token) in owners {
+        match direct_world(state, resolved, owner, token).await {
+            Ok(()) => count += 1,
+            Err(e) => {
+                tracing::warn!(%owner, "world: director round failed: {e}");
+                if let Err(re) = repo.release_claim(owner, token).await {
+                    tracing::warn!(%owner, "world: release_claim failed: {re}");
+                }
+            }
+        }
+    }
+    match repo.count_enrolled_missing_worldview().await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            count = n,
+            "world: enrolled owner(s) have no worldview; skipping until downstream provides one"
+        ),
+        Err(e) => tracing::warn!("world: worldview count failed: {e}"),
+    }
+    Ok(count)
+}
+
+/// One owner's round (spec §2.3–§2.4). Any Err ⇒ caller releases the claim;
+/// nothing has been written (persist_round is transactional). `token` is the
+/// ownership timestamp from `claim_due`, threaded through to every write so a
+/// round that outlives WORLD_CLAIM_STALE can't clobber a newer claim.
+async fn direct_world(
+    state: &AppState,
+    resolved: &ResolvedWorldDirector,
+    owner: Uuid,
+    token: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    let repo = WorldRepo { pool: &state.pool };
+
+    let mut roster = repo
+        .list_active_roster(owner, (WORLD_ROSTER_CAP + 1) as i64)
+        .await
+        .map_err(|e| format!("roster load failed: {e}"))?;
+    if roster.is_empty() {
+        // Nothing to simulate; stamp the run so the owner isn't re-claimed
+        // every tick until the interval passes.
+        return repo
+            .mark_ran(owner, token)
+            .await
+            .map_err(|e| format!("mark_ran (empty roster) failed: {e}"));
+    }
+    if roster.len() > WORLD_ROSTER_CAP {
+        tracing::warn!(%owner, cap = WORLD_ROSTER_CAP, "world: roster truncated");
+        roster.truncate(WORLD_ROSTER_CAP);
+    }
+
+    let Some((worldview, stored_hash, worldview_updated_at)) = repo
+        .worldview_state(owner)
+        .await
+        .map_err(|e| format!("worldview load failed: {e}"))?
+    else {
+        // claim_due required a worldview; it vanished between claim and
+        // round. Err ⇒ caller releases the claim; the owner is simply not
+        // claimable again until a worldview reappears (no warn spam).
+        return Err("worldview missing at round time".into());
+    };
+    let worldview_hash = worldview_sha256_hex(&worldview);
+    let reset = stored_hash.as_deref() != Some(worldview_hash.as_str());
+
+    let town = !state.config.world.town_disabled
+        && repo
+            .town_enabled(owner)
+            .await
+            .map_err(|e| format!("town_enabled load failed: {e}"))?;
+
+    let stories_active = !state.config.world.stories_disabled
+        && state
+            .model_config
+            .resolve_world_stories_director()
+            .is_some()
+        && repo
+            .stories_enabled(owner)
+            .await
+            .map_err(|e| format!("stories_enabled load failed: {e}"))?;
+    let recent_life = if stories_active && !reset {
+        let last_run: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT last_run_at FROM engine.world_states WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_optional(&state.pool)
+                .await
+                .map_err(|e| format!("world last_run load failed: {e}"))?
+                .flatten();
+        let since = last_run.unwrap_or_else(|| chrono::Utc::now() - chrono::Duration::hours(24));
+        let story_repo = StoryRepo { pool: &state.pool };
+        Some(
+            story_repo
+                .events_since(owner, since, WM_STORY_EVENTS_PER_PERSONA)
+                .await
+                .map_err(|e| format!("recent_life load failed: {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    // On reset the empty seed is what flips director_user_payload into its
+    // init header + "previous_seed": null branch — the old world's arc must
+    // not leak into the new worldview's first round.
+    let seed = if reset {
+        serde_json::json!({})
+    } else {
+        repo.load_seed(owner)
+            .await
+            .map_err(|e| format!("seed load failed: {e}"))?
+            .unwrap_or_else(|| serde_json::json!({}))
+    };
+    let memories = repo
+        .recent_extracted_memories(owner, WORLD_FEEDBACK_K)
+        .await
+        .map_err(|e| format!("memory feedback load failed: {e}"))?;
+
+    let payload = director_user_payload(
+        &seed,
+        &roster,
+        &memories,
+        town,
+        recent_life.as_ref(),
+        &worldview,
+    );
+    let req = ChatRequest {
+        model: resolved.model.clone(),
+        fallback_model: resolved.fallback_model.clone(),
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: resolved.director_prompt.clone(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: payload,
+            },
+        ],
+        temperature: resolved.temperature as f32,
+        max_tokens: resolved.max_tokens,
+        sampling: resolved.sampling,
+        user: Some(WORLD_AUDIT_USER.into()),
+        reasoning: resolved.reasoning.clone(),
+        response_format: resolved
+            .structured_output
+            .then(|| world_director_response_format(town)),
+        task: Some(WORLD_TASK.into()),
+        ..Default::default()
+    };
+    let raw = state
+        .openrouter
+        .execute(req)
+        .await
+        .map_err(|e| format!("world_director LLM call failed: {e}"))?;
+    super::record_generation(
+        &state.pool,
+        super::GenerationRecord {
+            task: WORLD_TASK,
+            session_id: None,
+            generation_id: raw.generation_id.as_deref(),
+            model: raw.model.as_deref(),
+            usage: raw.usage.as_ref(),
+        },
+    )
+    .await;
+
+    let output = parse_director_output(&raw.reply)
+        .ok_or_else(|| "world_director output did not parse".to_string())?;
+
+    // Keep only personas that exist in THIS roster; cap fragments per persona.
+    let roster_ids: std::collections::HashSet<Uuid> =
+        roster.iter().map(|r| r.instance_id).collect();
+    let mut digests = serde_json::Map::new();
+    let mut fragments: Vec<(Uuid, String)> = Vec::new();
+    for p in output.personas {
+        if !roster_ids.contains(&p.instance_id) {
+            tracing::warn!(%owner, instance = %p.instance_id, "world: unknown instance dropped");
+            continue;
+        }
+        if !p.digest.trim().is_empty() {
+            digests.insert(
+                p.instance_id.to_string(),
+                serde_json::Value::String(p.digest.trim().to_string()),
+            );
+        }
+        let mut frags: Vec<String> = p
+            .script_fragments
+            .into_iter()
+            .map(|f| f.trim().to_string())
+            .filter(|f| !f.is_empty())
+            .collect();
+        if frags.len() > WORLD_FRAGMENTS_PER_PERSONA_CAP {
+            tracing::warn!(%owner, instance = %p.instance_id, "world: fragments truncated");
+            frags.truncate(WORLD_FRAGMENTS_PER_PERSONA_CAP);
+        }
+        fragments.extend(frags.into_iter().map(|f| (p.instance_id, f)));
+    }
+
+    // Batch-embed all fragments in one Voyage call (order-preserving).
+    let texts: Vec<&str> = fragments.iter().map(|(_, f)| f.as_str()).collect();
+    let embeddings = state
+        .embed
+        .embed_documents(&texts)
+        .await
+        .map_err(|e| format!("embed_documents failed: {e}"))?;
+    let inserts: Vec<FragmentInsert> = fragments
+        .into_iter()
+        .zip(embeddings)
+        .map(|((instance_id, content), embedding)| FragmentInsert {
+            instance_id,
+            content,
+            embedding,
+        })
+        .collect();
+
+    let posts = if town {
+        validate_director_posts(
+            &output.posts,
+            &roster_ids,
+            chrono::Utc::now(),
+            resolved.interval_hours,
+            owner,
+        )
+    } else {
+        Vec::new()
+    };
+
+    let script_date = chrono::Utc::now().date_naive();
+    repo.persist_round(
+        owner,
+        &output.seed,
+        &serde_json::Value::Object(digests),
+        &inserts,
+        &posts,
+        script_date,
+        resolved.retention_days,
+        &worldview_hash,
+        reset,
+        worldview_updated_at,
+        token,
+    )
+    .await
+    .map_err(|e| format!("persist_round failed: {e}"))
+}
+
+/// Assemble the director's user message: framing header + structured JSON of
+/// previous seed / roster / memory feedback / worldview + the fixed rules.
+/// `town` appends `WORLD_TOWN_POST_RULES` (the posts rule) for town-enabled
+/// owners only — memories-only owners see no mention of posts. `recent_life`
+/// is `Some` only for stories-active owners (World System v2, spec §4): each
+/// persona's JSON entry gains a `recent_life` array and
+/// `WORLD_STORIES_WM_RULES` is appended. `None` adds no `recent_life` key
+/// anywhere and no stories rule — the stories dimension only; every payload
+/// still carries `worldview` and rule 5 regardless (see below).
+/// `worldview` (spec §3) always rides the `data` JSON's `worldview` key and
+/// rule 5 always applies — there is no v1-shaped "no worldview" branch.
+fn director_user_payload(
+    seed: &serde_json::Value,
+    roster: &[RosterEntry],
+    memories: &[String],
+    town: bool,
+    recent_life: Option<&std::collections::HashMap<Uuid, Vec<(String, String)>>>,
+    worldview: &str,
+) -> String {
+    let is_init = seed.as_object().map(|o| o.is_empty()).unwrap_or(false);
+    let personas: Vec<serde_json::Value> = roster
+        .iter()
+        .map(|r| {
+            let mut p = serde_json::json!({
+                "instance_id": r.instance_id,
+                "name": r.name,
+                "personality": r.tip_personality,
+                "profile": r.art_metadata,
+            });
+            if let Some(life) = recent_life {
+                let events: Vec<serde_json::Value> = life
+                    .get(&r.instance_id)
+                    .map(|evs| {
+                        evs.iter()
+                            .map(|(cat, c)| serde_json::json!({"category": cat, "content": c}))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                p["recent_life"] = serde_json::Value::Array(events);
+            }
+            p
+        })
+        .collect();
+    let data = serde_json::json!({
+        "worldview": worldview,
+        "previous_seed": if is_init { serde_json::Value::Null } else { seed.clone() },
+        "personas": personas,
+        "recent_user_memories": memories,
+    });
+    let header = if is_init {
+        "初始化这个世界：根据下列角色设定推演他们之间的初始关系（seed），并生成当期剧本。"
+    } else {
+        "延续这个世界：在 previous_seed 的基础上推演关系发展，并生成当期剧本。"
+    };
+    let mut rules = WORLD_DIRECTOR_RULES.to_string();
+    if town {
+        rules.push_str(WORLD_TOWN_POST_RULES);
+    }
+    if recent_life.is_some() {
+        rules.push_str(WORLD_STORIES_WM_RULES);
+    }
+    format!(
+        "{header}\n\n{}\n\n{rules}",
+        serde_json::to_string_pretty(&data).unwrap_or_default()
+    )
+}
+
+/// OpenRouter `response_format` for the director round. `strict` is false —
+/// `seed` is deliberately free-form (the engine stores it opaquely). `town`
+/// attaches the `posts` array (schema + required) only for town-enabled
+/// owners — memories-only owners get no posts key in the schema at all.
+fn world_director_response_format(town: bool) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "world_director_round",
+            "strict": false,
+            "schema": {
+                "type": "object",
+                "required": ["seed", "personas"],
+                "properties": {
+                    "seed": { "type": "object" },
+                    "personas": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["instance_id", "digest", "script_fragments"],
+                            "properties": {
+                                "instance_id": { "type": "string" },
+                                "digest": { "type": "string" },
+                                "script_fragments": {
+                                    "type": "array",
+                                    "items": { "type": "string" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    if town {
+        v["json_schema"]["schema"]["properties"]["posts"] = serde_json::json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["instance_id", "content", "publish_at"],
+                "properties": {
+                    "instance_id": { "type": "string" },
+                    "content": { "type": "string" },
+                    "publish_at": { "type": "string" }
+                }
+            }
+        });
+        v["json_schema"]["schema"]["required"] = serde_json::json!(["seed", "personas", "posts"]);
+    }
+    v
+}
+
+/// Lenient parse: direct JSON first, then the shared balanced-brace block
+/// extractor (`super::find_json_block`, in pipeline/mod.rs) for models that
+/// wrap JSON in prose/fences.
+fn parse_director_output(raw: &str) -> Option<DirectorOutput> {
+    if let Ok(v) = serde_json::from_str::<DirectorOutput>(raw) {
+        return Some(v);
+    }
+    let block = super::find_json_block(raw)?;
+    serde_json::from_str::<DirectorOutput>(block).ok()
+}
+
+/// Validate + clamp the director's raw `posts` entries (spec town §2): keep
+/// only roster instances with non-blank content and a parseable ISO-8601
+/// publish_at, clamped into `[now, now + horizon_hours]`. Malformed entries
+/// are dropped with a warn, mirroring unknown-persona handling.
+fn validate_director_posts(
+    raw: &[serde_json::Value],
+    roster_ids: &std::collections::HashSet<Uuid>,
+    now: chrono::DateTime<chrono::Utc>,
+    horizon_hours: u32,
+    owner: Uuid,
+) -> Vec<PostInsert> {
+    let max_at = now + chrono::Duration::hours(i64::from(horizon_hours));
+    let mut out = Vec::new();
+    for entry in raw {
+        let Ok(p) = serde_json::from_value::<DirectorPost>(entry.clone()) else {
+            tracing::warn!(%owner, "world: malformed post entry dropped");
+            continue;
+        };
+        if !roster_ids.contains(&p.instance_id) {
+            tracing::warn!(%owner, instance = %p.instance_id, "world: post for unknown instance dropped");
+            continue;
+        }
+        let content = p.content.trim().to_string();
+        if content.is_empty() {
+            tracing::warn!(%owner, "world: blank post content dropped");
+            continue;
+        }
+        let Ok(at) = chrono::DateTime::parse_from_rfc3339(&p.publish_at) else {
+            tracing::warn!(%owner, publish_at = %p.publish_at, "world: unparseable publish_at dropped");
+            continue;
+        };
+        let scheduled_at = at.with_timezone(&chrono::Utc).clamp(now, max_at);
+        out.push(PostInsert {
+            instance_id: p.instance_id,
+            content,
+            scheduled_at,
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn world_audit_user_is_distinct_from_dreaming() {
+        assert_eq!(WORLD_AUDIT_USER, "11111111-1111-1111-1111-111111111112");
+        assert!(WORLD_AUDIT_USER.ends_with('2'));
+    }
+
+    #[test]
+    fn parse_director_output_handles_clean_and_fenced_json() {
+        let id = Uuid::new_v4();
+        let clean = format!(
+            r#"{{"seed":{{"arc":"x"}},"personas":[{{"instance_id":"{id}","digest":"d","script_fragments":["f1","f2"]}}]}}"#
+        );
+        let out = parse_director_output(&clean).expect("clean parses");
+        assert_eq!(out.personas.len(), 1);
+        assert_eq!(out.personas[0].script_fragments, vec!["f1", "f2"]);
+        assert!(
+            out.posts.is_empty(),
+            "clean sample has no posts key — #[serde(default)] must still parse"
+        );
+
+        let fenced = format!("好的：\n```json\n{clean}\n```");
+        assert!(parse_director_output(&fenced).is_some(), "fenced parses");
+
+        assert!(parse_director_output("no json at all").is_none());
+        assert!(
+            parse_director_output(r#"{"personas": []}"#).is_none(),
+            "missing seed ⇒ None"
+        );
+    }
+
+    #[test]
+    fn director_payload_flags_init_vs_continuation() {
+        let roster = vec![RosterEntry {
+            instance_id: Uuid::new_v4(),
+            name: "Aria".into(),
+            tip_personality: Some("温柔".into()),
+            art_metadata: serde_json::json!({"backstory": "咖啡店店主"}),
+        }];
+        let init = director_user_payload(
+            &serde_json::json!({}),
+            &roster,
+            &[],
+            false,
+            None,
+            "现代都市",
+        );
+        assert!(init.contains("初始化这个世界"));
+        assert!(init.contains("\"previous_seed\": null"));
+        assert!(init.contains("Aria"));
+        assert!(init.contains("用户是场外人"), "fixed rules always present");
+
+        let cont = director_user_payload(
+            &serde_json::json!({"arc": "opening"}),
+            &roster,
+            &["用户喜欢旅行".into()],
+            false,
+            None,
+            "现代都市",
+        );
+        assert!(cont.contains("延续这个世界"));
+        assert!(cont.contains("\"arc\": \"opening\""));
+        assert!(cont.contains("用户喜欢旅行"));
+    }
+
+    #[test]
+    fn director_payload_recent_life_only_when_stories_active() {
+        let inst = Uuid::new_v4();
+        let roster = vec![RosterEntry {
+            instance_id: inst,
+            name: "Aria".into(),
+            tip_personality: None,
+            art_metadata: serde_json::json!({}),
+        }];
+        let v1 = director_user_payload(
+            &serde_json::json!({}),
+            &roster,
+            &[],
+            false,
+            None,
+            "现代都市",
+        );
+        assert!(
+            !v1.contains("recent_life"),
+            "v1 payload has no stories trace"
+        );
+        assert!(!v1.contains("个人生活"), "no stories rule for v1");
+
+        let mut life = std::collections::HashMap::new();
+        life.insert(inst, vec![("work".to_string(), "定了开业日期".to_string())]);
+        let v2 = director_user_payload(
+            &serde_json::json!({}),
+            &roster,
+            &[],
+            false,
+            Some(&life),
+            "现代都市",
+        );
+        assert!(v2.contains("recent_life"));
+        assert!(v2.contains("定了开业日期"));
+        assert!(v2.contains("各角色的个人生活"), "stories rule appended");
+        assert!(
+            v2.contains("绝不编造用户的言行"),
+            "user-grounding kept at WM layer"
+        );
+    }
+
+    #[test]
+    fn world_director_response_format_shape() {
+        let v = world_director_response_format(false);
+        assert_eq!(v["type"], "json_schema");
+        assert_eq!(v["json_schema"]["strict"], false);
+        let required = v["json_schema"]["schema"]["required"].as_array().unwrap();
+        assert!(required.iter().any(|r| r == "seed"));
+        assert!(required.iter().any(|r| r == "personas"));
+    }
+
+    #[test]
+    fn director_posts_validated_clamped_and_dropped() {
+        let inst = Uuid::new_v4();
+        let stranger = Uuid::new_v4();
+        let roster_ids: std::collections::HashSet<Uuid> = [inst].into_iter().collect();
+        let now = chrono::Utc::now();
+        let horizon_hours = 24u32;
+        let raw = serde_json::json!([
+            // valid, inside window
+            {"instance_id": inst, "content": "去了海边", "publish_at": (now + chrono::Duration::hours(2)).to_rfc3339()},
+            // beyond window ⇒ clamped to now + horizon
+            {"instance_id": inst, "content": "远期计划", "publish_at": (now + chrono::Duration::hours(100)).to_rfc3339()},
+            // past ⇒ clamped up to now
+            {"instance_id": inst, "content": "旧闻", "publish_at": (now - chrono::Duration::hours(5)).to_rfc3339()},
+            // unknown instance ⇒ dropped
+            {"instance_id": stranger, "content": "x", "publish_at": now.to_rfc3339()},
+            // malformed timestamp ⇒ dropped
+            {"instance_id": inst, "content": "y", "publish_at": "not-a-date"},
+            // blank content ⇒ dropped
+            {"instance_id": inst, "content": "  ", "publish_at": now.to_rfc3339()},
+        ]);
+        let posts = validate_director_posts(
+            raw.as_array().unwrap(),
+            &roster_ids,
+            now,
+            horizon_hours,
+            Uuid::new_v4(),
+        );
+        assert_eq!(posts.len(), 3);
+        let max_at = now + chrono::Duration::hours(i64::from(horizon_hours));
+        assert!(posts
+            .iter()
+            .all(|p| p.scheduled_at >= now && p.scheduled_at <= max_at));
+        assert_eq!(posts[2].scheduled_at, now, "past publish_at clamps to now");
+    }
+
+    #[test]
+    fn world_director_response_format_town_arm() {
+        let base = world_director_response_format(false);
+        assert!(base["json_schema"]["schema"]["properties"]["posts"].is_null());
+        let town = world_director_response_format(true);
+        assert_eq!(
+            town["json_schema"]["schema"]["properties"]["posts"]["type"],
+            "array"
+        );
+        let required = town["json_schema"]["schema"]["required"]
+            .as_array()
+            .unwrap();
+        assert!(required.iter().any(|r| r == "posts"));
+    }
+
+    #[test]
+    fn director_payload_mentions_posts_only_for_town() {
+        let roster = vec![RosterEntry {
+            instance_id: Uuid::new_v4(),
+            name: "Aria".into(),
+            tip_personality: None,
+            art_metadata: serde_json::json!({}),
+        }];
+        let plain = director_user_payload(
+            &serde_json::json!({}),
+            &roster,
+            &[],
+            false,
+            None,
+            "现代都市",
+        );
+        assert!(!plain.contains("posts"), "no posts rule for memories-only");
+        let town =
+            director_user_payload(&serde_json::json!({}), &roster, &[], true, None, "现代都市");
+        assert!(
+            town.contains("posts"),
+            "town payload carries the posts rule"
+        );
+    }
+
+    #[test]
+    fn worldview_hash_is_sha256_lowercase_hex() {
+        // Known vector: sha256("a").
+        assert_eq!(
+            worldview_sha256_hex("a"),
+            "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+        );
+        assert_eq!(worldview_sha256_hex("现代都市").len(), 64);
+        assert_ne!(worldview_sha256_hex("古代"), worldview_sha256_hex("科幻"));
+    }
+
+    #[test]
+    fn director_payload_carries_worldview_and_rule() {
+        let roster = vec![RosterEntry {
+            instance_id: Uuid::new_v4(),
+            name: "Aria".into(),
+            tip_personality: None,
+            art_metadata: serde_json::json!({}),
+        }];
+        let p = director_user_payload(
+            &serde_json::json!({}),
+            &roster,
+            &[],
+            false,
+            None,
+            "赛博朋克近未来都市",
+        );
+        assert!(
+            p.contains("\"worldview\""),
+            "payload data carries the worldview key"
+        );
+        assert!(p.contains("赛博朋克近未来都市"));
+        assert!(p.contains("5) 一切设定"), "worldview rule is rule 5");
+
+        // Renumbering lock: conditional rules follow the new rule 5.
+        let town =
+            director_user_payload(&serde_json::json!({}), &roster, &[], true, None, "现代都市");
+        assert!(town.contains("6) posts"), "town rule renumbered to 6");
+        let mut life = std::collections::HashMap::new();
+        life.insert(
+            roster[0].instance_id,
+            vec![("work".to_string(), "e".to_string())],
+        );
+        let stories = director_user_payload(
+            &serde_json::json!({}),
+            &roster,
+            &[],
+            false,
+            Some(&life),
+            "现代都市",
+        );
+        assert!(
+            stories.contains("7) 各角色的个人生活"),
+            "stories rule renumbered to 7"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn direct_world_persists_seed_and_digests_without_fragments(pool: sqlx::PgPool) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let owner = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('W','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO engine.world_enrollments (owner_uid) VALUES ($1)")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, '现代都市')",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let reply = serde_json::json!({
+            "seed": {"arc": "第一幕"},
+            "personas": [{
+                "instance_id": instance_id,
+                "digest": "W 在筹备开店",
+                "script_fragments": []
+            }]
+        });
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-world", "model": "w/m",
+                "choices": [{"message": {"content": reply.to_string()}}],
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.world_director]\nmodel=\"w/m\"\nfilter_prompt=\"direct\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let resolved = state.model_config.resolve_world_director().unwrap();
+
+        let repo = eros_engine_store::world::WorldRepo { pool: &pool };
+        repo.ensure_states_for_enrollments().await.unwrap();
+        // Claim the owner so claimed_at is actually SET before direct_world
+        // runs persist_round — otherwise the `assert!(claimed.is_none())`
+        // below is vacuous (never-claimed rows are already NULL).
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (_o, token) = claimed[0];
+
+        direct_world(&state, &resolved, owner, token)
+            .await
+            .expect("round ok");
+
+        let (seed, digests, version, claimed): (
+            serde_json::Value,
+            serde_json::Value,
+            i32,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ) = sqlx::query_as(
+            "SELECT seed, digests, seed_version, claimed_at \
+             FROM engine.world_states WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(seed["arc"], "第一幕");
+        assert_eq!(digests[instance_id.to_string()], "W 在筹备开店");
+        assert_eq!(version, 2);
+        assert!(claimed.is_none());
+
+        let model: Option<String> = sqlx::query_scalar(
+            "SELECT model FROM engine.llm_generations WHERE task = 'world_director'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the sweeper must record its generation");
+        assert!(model.is_some());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn direct_world_resets_on_worldview_change(pool: sqlx::PgPool) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let owner = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('W','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO engine.world_enrollments (owner_uid) VALUES ($1)")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, '现代都市')",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let reply = serde_json::json!({
+            "seed": {"arc": "第一幕"},
+            "personas": [{
+                "instance_id": instance_id,
+                "digest": "W 在筹备开店",
+                "script_fragments": []
+            }]
+        });
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-world", "model": "w/m",
+                "choices": [{"message": {"content": reply.to_string()}}],
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.world_director]\nmodel=\"w/m\"\nfilter_prompt=\"direct\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let resolved = state.model_config.resolve_world_director().unwrap();
+
+        let repo = eros_engine_store::world::WorldRepo { pool: &pool };
+        repo.ensure_states_for_enrollments().await.unwrap();
+
+        // Two extra pre-seeded rows belonging to a DIFFERENT worldview era
+        // than the current '现代都市' row: an old fragment (must be purged)
+        // and a stale seed (must not leak into the payload's previous_seed).
+        let old_embedding = format!("[{}]", vec!["0"; 512].join(","));
+        sqlx::query(
+            "INSERT INTO engine.world_memories (owner_uid, instance_id, content, embedding, script_date) \
+             VALUES ($1, $2, '旧世界片段', $3::vector, current_date)",
+        )
+        .bind(owner)
+        .bind(instance_id)
+        .bind(&old_embedding)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE engine.world_states SET worldview_hash = $2 WHERE owner_uid = $1")
+            .bind(owner)
+            .bind(worldview_sha256_hex("旧世界观"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.world_states SET seed = '{\"arc\":\"旧剧情\"}'::jsonb WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (_o, token) = claimed[0];
+
+        direct_world(&state, &resolved, owner, token)
+            .await
+            .expect("round ok");
+
+        let reqs = mock.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let body = String::from_utf8_lossy(&reqs[0].body);
+        assert!(
+            body.contains("初始化这个世界"),
+            "reset forces the init header even though world_states.seed was non-empty"
+        );
+        assert!(
+            body.contains("现代都市"),
+            "current worldview reaches the payload"
+        );
+        assert!(
+            !body.contains("旧世界片段"),
+            "old-era fragment content must not leak into the payload"
+        );
+        assert!(
+            !body.contains("旧剧情"),
+            "reset drops the stale seed — previous_seed must be null, not the old arc"
+        );
+
+        let frag_contents: Vec<String> =
+            sqlx::query_scalar("SELECT content FROM engine.world_memories WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            !frag_contents.iter().any(|c| c == "旧世界片段"),
+            "the pre-seeded old-era fragment must be purged on reset"
+        );
+
+        let (hash, set_at): (Option<String>, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as(
+                "SELECT worldview_hash, worldview_set_at FROM engine.world_states WHERE owner_uid = $1",
+            )
+            .bind(owner)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(hash, Some(worldview_sha256_hex("现代都市")));
+        assert!(set_at.is_some(), "reset stamps the era start");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn direct_world_parse_failure_writes_nothing(pool: sqlx::PgPool) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let owner = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('X','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1,$2)")
+            .bind(genome_id)
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO engine.world_enrollments (owner_uid) VALUES ($1)")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, '现代都市')",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-bad", "model": "w/m",
+                "choices": [{"message": {"content": "这不是 JSON"}}],
+            })))
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.world_director]\nmodel=\"w/m\"\nfilter_prompt=\"direct\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let resolved = state.model_config.resolve_world_director().unwrap();
+        let repo = eros_engine_store::world::WorldRepo { pool: &pool };
+        repo.ensure_states_for_enrollments().await.unwrap();
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (_o, token) = claimed[0];
+
+        let err = direct_world(&state, &resolved, owner, token)
+            .await
+            .unwrap_err();
+        assert!(err.contains("did not parse"));
+
+        // Nothing persisted: version still 1, seed still {}, no memories.
+        let (seed, version): (serde_json::Value, i32) = sqlx::query_as(
+            "SELECT seed, seed_version FROM engine.world_states WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(seed, serde_json::json!({}));
+        assert_eq!(version, 1);
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.world_memories WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn direct_world_skips_posts_when_town_disabled(pool: sqlx::PgPool) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let owner = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('W','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // Owner is town-enrolled at the DB level — the kill-switch must win
+        // over this, not just gate on it.
+        sqlx::query(
+            "INSERT INTO engine.world_enrollments (owner_uid, town_enabled) VALUES ($1, true)",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, '现代都市')",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let reply = serde_json::json!({
+            "seed": {"arc": "第一幕"},
+            "personas": [{
+                "instance_id": instance_id,
+                "digest": "W 在筹备开店",
+                "script_fragments": []
+            }],
+            "posts": [{
+                "instance_id": instance_id,
+                "content": "开业啦",
+                "publish_at": chrono::Utc::now().to_rfc3339()
+            }]
+        });
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-world", "model": "w/m",
+                "choices": [{"message": {"content": reply.to_string()}}],
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.config.world.town_disabled = true;
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.world_director]\nmodel=\"w/m\"\nfilter_prompt=\"direct\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let resolved = state.model_config.resolve_world_director().unwrap();
+
+        let repo = eros_engine_store::world::WorldRepo { pool: &pool };
+        repo.ensure_states_for_enrollments().await.unwrap();
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (_o, token) = claimed[0];
+
+        direct_world(&state, &resolved, owner, token)
+            .await
+            .expect("round ok");
+
+        let posts: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.world_posts WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            posts, 0,
+            "town_disabled must suppress posts even when town_enabled=true"
+        );
+
+        let (seed, digests): (serde_json::Value, serde_json::Value) =
+            sqlx::query_as("SELECT seed, digests FROM engine.world_states WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(seed["arc"], "第一幕");
+        assert_eq!(digests[instance_id.to_string()], "W 在筹备开店");
+    }
+
+    /// End-to-end wiring proof for the DB-driven `stories_active` branch
+    /// (spec §4): a real `persona_story_events` row for a stories-enabled
+    /// owner must reach the director's actual OpenRouter payload via
+    /// `StoryRepo::events_since` + `director_user_payload`, not just the
+    /// pure-layer unit test's hand-built HashMap.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn direct_world_injects_recent_life_when_stories_active(pool: sqlx::PgPool) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let owner = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('W','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_enrollments (owner_uid, stories_enabled) VALUES ($1, true)",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, '现代都市')",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // last_run_at stays NULL for this never-run owner — direct_world's
+        // `since` fallback (now() - 24h) is what must pick up this event.
+        sqlx::query(
+            "INSERT INTO engine.persona_story_events \
+             (owner_uid, instance_id, category, content, story_date) \
+             VALUES ($1, $2, 'work', '刚拿到新工作的offer', current_date)",
+        )
+        .bind(owner)
+        .bind(instance_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let reply = serde_json::json!({
+            "seed": {"arc": "第一幕"},
+            "personas": [{
+                "instance_id": instance_id,
+                "digest": "W 在筹备开店",
+                "script_fragments": []
+            }]
+        });
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-world", "model": "w/m",
+                "choices": [{"message": {"content": reply.to_string()}}],
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.world_director]\nmodel=\"w/m\"\nfilter_prompt=\"direct\"\n\
+                 [tasks.world_stories_director]\nmodel=\"w/s\"\nfilter_prompt=\"live\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let resolved = state.model_config.resolve_world_director().unwrap();
+        assert!(
+            state
+                .model_config
+                .resolve_world_stories_director()
+                .is_some(),
+            "world_stories_director must resolve for stories_active to be true"
+        );
+
+        let repo = eros_engine_store::world::WorldRepo { pool: &pool };
+        repo.ensure_states_for_enrollments().await.unwrap();
+        // First-sight-of-worldview is a reset, which suppresses recent_life;
+        // this test exercises the normal continuation path — pre-stamp the
+        // hash the round will compute so it is NOT a reset.
+        sqlx::query("UPDATE engine.world_states SET worldview_hash = $2 WHERE owner_uid = $1")
+            .bind(owner)
+            .bind(worldview_sha256_hex("现代都市"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (owner_claimed, token) = claimed[0];
+        assert_eq!(owner_claimed, owner);
+
+        direct_world(&state, &resolved, owner, token)
+            .await
+            .expect("round ok");
+
+        // The key assertion: the real DB-driven recent_life glue must have
+        // put the story event's content into the actual LLM request body —
+        // not just a hand-built HashMap in the pure-layer unit test.
+        let reqs = mock.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let body = String::from_utf8_lossy(&reqs[0].body);
+        assert!(
+            body.contains("recent_life"),
+            "payload must carry the recent_life key when stories-active"
+        );
+        assert!(
+            body.contains("刚拿到新工作的offer"),
+            "the story event content must reach the director payload"
+        );
+
+        // And the round completed successfully end-to-end.
+        let (seed, digests): (serde_json::Value, serde_json::Value) =
+            sqlx::query_as("SELECT seed, digests FROM engine.world_states WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(seed["arc"], "第一幕");
+        assert_eq!(digests[instance_id.to_string()], "W 在筹备开店");
+    }
+
+    /// spec §7 coverage gap: `recent_life` must be suppressed on a reset
+    /// round even when stories are active and a real `persona_story_events`
+    /// row exists — `direct_world`'s `stories_active && !reset` guard, not
+    /// just the pure-layer unit test's hand-built HashMap. The reset purges
+    /// story data in the same transaction (spec §2 reset inventory), so
+    /// feeding the pre-reset event into this round's payload would leak
+    /// old-era content into the new world.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn direct_world_reset_suppresses_recent_life(pool: sqlx::PgPool) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let owner = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('W','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_enrollments (owner_uid, stories_enabled) VALUES ($1, true)",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, '现代都市')",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.persona_story_events \
+             (owner_uid, instance_id, category, content, story_date) \
+             VALUES ($1, $2, 'work', '刚拿到新工作的offer', current_date)",
+        )
+        .bind(owner)
+        .bind(instance_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let reply = serde_json::json!({
+            "seed": {"arc": "第一幕"},
+            "personas": [{
+                "instance_id": instance_id,
+                "digest": "W 在筹备开店",
+                "script_fragments": []
+            }]
+        });
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-world", "model": "w/m",
+                "choices": [{"message": {"content": reply.to_string()}}],
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.world_director]\nmodel=\"w/m\"\nfilter_prompt=\"direct\"\n\
+                 [tasks.world_stories_director]\nmodel=\"w/s\"\nfilter_prompt=\"live\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let resolved = state.model_config.resolve_world_director().unwrap();
+        assert!(
+            state
+                .model_config
+                .resolve_world_stories_director()
+                .is_some(),
+            "world_stories_director must resolve for stories_active to be true"
+        );
+
+        let repo = eros_engine_store::world::WorldRepo { pool: &pool };
+        repo.ensure_states_for_enrollments().await.unwrap();
+        // Stamp a DIFFERENT worldview hash than the current content's — this
+        // round must compute a mismatch and take the reset path.
+        sqlx::query("UPDATE engine.world_states SET worldview_hash = $2 WHERE owner_uid = $1")
+            .bind(owner)
+            .bind(worldview_sha256_hex("旧世界观"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (owner_claimed, token) = claimed[0];
+        assert_eq!(owner_claimed, owner);
+
+        direct_world(&state, &resolved, owner, token)
+            .await
+            .expect("round ok");
+
+        let reqs = mock.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let body = String::from_utf8_lossy(&reqs[0].body);
+        assert!(
+            body.contains("初始化这个世界"),
+            "reset forces the init header"
+        );
+        assert!(
+            !body.contains("recent_life"),
+            "reset must suppress recent_life even though stories are active \
+             and a persona_story_events row exists"
+        );
+        assert!(
+            !body.contains("刚拿到新工作的offer"),
+            "the suppressed pre-reset event's content must not leak into the payload"
+        );
+    }
+}

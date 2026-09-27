@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "1.8.1"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/etherfunlab/eros-engine"
+homepage = "https://github.com/etherfunlab/eros-engine"
+authors = ["etherfunlab <henrylin@etherfun.xyz>"]
+
+[workspace.dependencies]
+tokio = { version = "1.40", features = ["full"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2"] }
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+async-trait = "0.1"
+utoipa = { version = "5", features = ["axum_extras", "uuid", "chrono"] }
+utoipa-axum = "0.2"
+utoipa-scalar = { version = "0.3", features = ["axum"] }
+# v10 makes the crypto backend a selectable feature (default enables none, which
+# panics at first decode). rust_crypto = pure-Rust provider, so OSS self-hosters
+# building for musl/Alpine/cross targets don't need the aws-lc-sys C toolchain.
+jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+eventsource-stream = "0.2"
+futures-util       = "0.3"
+tokio-stream       = "0.1"
+async-stream       = "0.3"
+ulid               = { version = "1", features = ["serde", "uuid"] }
+base64             = "0.22"

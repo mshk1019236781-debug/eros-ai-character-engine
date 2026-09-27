@@ -1,0 +1,59 @@
+[package]
+name = "eros-engine-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Binary crate — distributed as the GHCR image, NOT a crates.io library.
+# `cargo publish` (workspace or `-p eros-engine-server`) refuses it outright.
+publish = false
+
+[[bin]]
+name = "eros-engine"
+path = "src/main.rs"
+
+[dependencies]
+eros-engine-core = { path = "../eros-engine-core", version = "1.8.1" }
+eros-engine-llm  = { path = "../eros-engine-llm", version = "1.8.1" }
+eros-engine-store = { path = "../eros-engine-store", version = "1.8.1" }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+jsonwebtoken = { workspace = true }
+# JWKS fetch for Supabase asymmetric JWT validation. Workspace pins
+# rustls-tls so this stays fly.io / scratch-image friendly.
+reqwest = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+utoipa-scalar = { workspace = true }
+toml = "0.8"
+# Loaded once at server start so the documented `cp .env.example .env`
+# quickstart actually works without an explicit `set -a; source .env`.
+# In production (Fly.io / Docker) the file is absent, dotenv() returns
+# Err, and we silently fall through to the real environment.
+dotenvy = "0.15"
+futures-util = { workspace = true }
+tokio-stream = { workspace = true }
+async-stream = { workspace = true }
+ulid         = { workspace = true }
+base64       = { workspace = true }
+rand = "0.8"
+# 6-field cron schedule parser (sec min hr dom mon dow). Pure parser; the
+# sweeper drives ticks via tokio::time::sleep. No runtime scheduler.
+cron = "0.12"
+
+[dev-dependencies]
+wiremock = "0.6"
